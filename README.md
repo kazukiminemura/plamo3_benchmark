@@ -43,15 +43,31 @@ generator を使います。
 uv run plamo3-ov convert --output-dir ov-plamo3 --weight-format fp16 --max-seq-len 512
 ```
 
-`--weight-format` は `fp16` または `fp32` を指定できます。INT4圧縮はこの非Optimumルートでは
+`--weight-format` は `fp16`、`fp32`、`int8` を指定できます。`int8` は NNCF の
+`INT8_ASYM` weight compression を OpenVINO IR に適用します。INT4圧縮はこの非Optimumルートでは
 提供していません。
 既に `openvino_model.xml` がある場合、`convert` は本体IRを再利用して tokenizer/config だけ補完します。
-本体も作り直す場合は `--force` を付けます。
+`--weight-format int8` で既存の非INT8 IRを置き換える場合は、Windowsのファイルロックを避けるため
+`--force` を付けてPyTorchから作り直すか、別の出力ディレクトリを使います。
+
+```powershell
+uv run plamo3-ov convert --output-dir ov-plamo3-int8 --weight-format int8 --max-seq-len 512
+# 既存ディレクトリへ作り直す場合
+uv run plamo3-ov convert --output-dir ov-plamo3 --weight-format int8 --max-seq-len 512 --force
+```
 
 ## 推論
 
 ```powershell
 uv run plamo3-ov generate "これからの人工知能技術は" --model ov-plamo3 --max-new-tokens 128
+```
+
+推論デバイスは `--device` で指定できます。OpenVINO の device string をそのまま渡せます。
+
+```powershell
+uv run plamo3-ov generate "これからの人工知能技術は" --model ov-plamo3 --device CPU
+uv run plamo3-ov generate "これからの人工知能技術は" --model ov-plamo3-int8 --device GPU
+uv run plamo3-ov generate "これからの人工知能技術は" --model ov-plamo3-int8 --device AUTO:GPU,CPU
 ```
 
 ファイルや標準入力からもプロンプトを渡せます。
@@ -63,7 +79,7 @@ Get-Content prompt.txt | uv run plamo3-ov generate --stdin --model ov-plamo3
 
 主なオプション:
 
-- `--device CPU` / `GPU` / `AUTO`
+- `--device CPU` / `GPU` / `NPU` / `AUTO` / `AUTO:GPU,CPU`
 - `--temperature 0` で greedy decoding
 - `--top-p 0.95 --top-k 50`
 - `--stream` / `--no-stream`

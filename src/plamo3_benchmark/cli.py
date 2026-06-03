@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import gc
 import json
 import sys
 from pathlib import Path
@@ -9,6 +10,16 @@ from typing import Any
 
 
 DEFAULT_MODEL_ID = "pfnet/plamo-3-nict-8b-base"
+
+
+def _configure_output_encoding() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
 
 
 def _die(message: str, exit_code: int = 1) -> None:
@@ -46,6 +57,15 @@ def _import_openvino_converter() -> tuple[Any, Any]:
         _die("OpenVINO conversion dependencies are not installed. Run `uv sync` first.")
         raise exc
     return ov, openvino_tokenizers
+
+
+def _import_nncf() -> tuple[Any, Any]:
+    try:
+        from nncf import CompressWeightsMode, compress_weights
+    except ImportError as exc:
+        _die("NNCF is required for INT8 weight compression. Run `uv sync` first.")
+        raise exc
+    return compress_weights, CompressWeightsMode
 
 
 def _read_prompt(args: argparse.Namespace) -> str:
@@ -200,16 +220,49 @@ def _try_save_openvino_tokenizer(tokenizer: Any, ov: Any, openvino_tokenizers: A
         return "huggingface"
 
 
+def _apply_weight_compression(ov_model: Any, weight_format: str) -> Any:
+    if weight_format != "int8":
+        return ov_model
+
+    compress_weights, CompressWeightsMode = _import_nncf()
+    print("Compressing OpenVINO model weights to INT8_ASYM with NNCF...", file=sys.stderr)
+    return compress_weights(ov_model, mode=CompressWeightsMode.INT8_ASYM)
+
+
+def _save_openvino_model(ov: Any, ov_model: Any, xml_path: Path, *, compress_to_fp16: bool) -> None:
+    tmp_xml = xml_path.with_name(f"{xml_path.stem}.tmp{xml_path.suffix}")
+    tmp_bin = tmp_xml.with_suffix(".bin")
+    bin_path = xml_path.with_suffix(".bin")
+
+    for path in (tmp_xml, tmp_bin):
+        if path.exists():
+            path.unlink()
+
+    ov.save_model(ov_model, tmp_xml, compress_to_fp16=compress_to_fp16)
+    del ov_model
+    gc.collect()
+    tmp_bin.replace(bin_path)
+    tmp_xml.replace(xml_path)
+
+
+def _read_conversion_info(output_dir: Path) -> dict[str, Any]:
+    info_path = output_dir / "plamo3_ov_conversion.json"
+    if not info_path.exists():
+        return {}
+    try:
+        return json.loads(info_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def convert(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     _check_hugging_face_access(args.model)
 
-    if args.weight_format not in {"fp32", "fp16"}:
+    if args.weight_format not in {"fp32", "fp16", "int8"}:
         _die(
-            "This OpenVINO GenAI conversion path supports --weight-format fp32 or fp16 only. "
-            "INT4 compression for LLMs is normally provided by Optimum/NNCF model export, "
-            "which you asked not to use."
+            "This OpenVINO GenAI conversion path supports --weight-format fp32, fp16, or int8."
         )
 
     AutoTokenizer, _, _ = _import_transformers()
@@ -219,6 +272,15 @@ def convert(args: argparse.Namespace) -> int:
     existing_model = output_dir / "openvino_model.xml"
     if existing_model.exists() and not args.force:
         print(f"Reusing existing OpenVINO model: {existing_model}", file=sys.stderr)
+        existing_info = _read_conversion_info(output_dir)
+        if args.weight_format == "int8" and existing_info.get("weight_format") != "int8":
+            _die(
+                "openvino_model.xml already exists and is not marked as INT8. "
+                "On Windows, in-place compression can leave the existing .bin locked. "
+                "Re-run with `--force` to rebuild and save INT8, or use a new "
+                "--output-dir such as `ov-plamo3-int8`."
+            )
+
         _save_tokenizer_and_configs(tokenizer, args.model, output_dir)
         tokenizer_backend = _try_save_openvino_tokenizer(tokenizer, ov, openvino_tokenizers, output_dir)
         try:
@@ -272,7 +334,7 @@ def convert(args: argparse.Namespace) -> int:
                 return_dict=False,
             )[0]
 
-    dtype = torch.float16 if args.weight_format == "fp16" else torch.float32
+    dtype = torch.float16 if args.weight_format in {"fp16", "int8"} else torch.float32
     print("Loading Hugging Face model with trust_remote_code=True...", file=sys.stderr)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
@@ -330,7 +392,13 @@ def convert(args: argparse.Namespace) -> int:
             f"OpenVINO GenAI model adapter/exporter. Original error: {exc}"
         )
 
-    ov.save_model(ov_model, output_dir / "openvino_model.xml", compress_to_fp16=args.weight_format == "fp16")
+    ov_model = _apply_weight_compression(ov_model, args.weight_format)
+    _save_openvino_model(
+        ov,
+        ov_model,
+        output_dir / "openvino_model.xml",
+        compress_to_fp16=args.weight_format == "fp16",
+    )
     _save_tokenizer_and_configs(tokenizer, args.model, output_dir)
 
     tokenizer_backend = _try_save_openvino_tokenizer(tokenizer, ov, openvino_tokenizers, output_dir)
@@ -406,6 +474,7 @@ def _generate_with_openvino_core(args: argparse.Namespace, prompt: str) -> int:
             "`--max-seq-len`, for example `--max-seq-len 512`."
         )
 
+    print(f"Using OpenVINO inference device: {args.device}", file=sys.stderr)
     compiled = core.compile_model(ov_model, args.device)
     output = compiled.output(0)
 
@@ -463,6 +532,7 @@ def generate(args: argparse.Namespace) -> int:
         return _generate_with_openvino_core(args, prompt)
 
     try:
+        print(f"Using OpenVINO GenAI inference device: {args.device}", file=sys.stderr)
         pipe = ov_genai.LLMPipeline(model_source, args.device)
     except RuntimeError as exc:
         _die(f"OpenVINO GenAI could not load the model directory: {exc}")
@@ -510,8 +580,8 @@ def build_parser() -> argparse.ArgumentParser:
     convert_parser.add_argument(
         "--weight-format",
         default="fp16",
-        choices=["fp32", "fp16"],
-        help="OpenVINO save precision for the experimental non-Optimum conversion path.",
+        choices=["fp32", "fp16", "int8"],
+        help="OpenVINO save precision. int8 applies NNCF INT8_ASYM weight compression.",
     )
     convert_parser.add_argument("--example-prompt", help="Prompt used to trace the PyTorch model.")
     convert_parser.add_argument(
@@ -544,7 +614,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     generate_parser.add_argument("--prompt-file")
     generate_parser.add_argument("--stdin", action="store_true")
-    generate_parser.add_argument("--device", default="CPU")
+    generate_parser.add_argument(
+        "--device",
+        default="CPU",
+        help=(
+            "OpenVINO inference device, such as CPU, GPU, NPU, AUTO, GPU.0, "
+            "or AUTO:GPU,CPU. Default: CPU."
+        ),
+    )
     generate_parser.add_argument("--max-new-tokens", type=int, default=128)
     generate_parser.add_argument("--temperature", type=float, default=0.8)
     generate_parser.add_argument("--top-p", type=float, default=0.95)
@@ -558,6 +635,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_output_encoding()
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)
