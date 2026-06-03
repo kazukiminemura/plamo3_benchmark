@@ -77,6 +77,22 @@ uv run plamo3-ov generate --prompt-file prompt.txt --model ov-plamo3
 Get-Content prompt.txt | uv run plamo3-ov generate --stdin --model ov-plamo3
 ```
 
+## チャット
+
+CLI上で対話するには `chat` を使います。
+
+```powershell
+uv run plamo3-ov chat --model ov-plamo3-int8 --device GPU --max-new-tokens 128
+```
+
+`chat` は起動時にモデルを一度だけロードし、同じセッション内の各ターンで再利用します。
+チャット中は `/exit` または `/quit` で終了、`/reset` で履歴をクリアできます。
+システムプロンプトを付ける場合:
+
+```powershell
+uv run plamo3-ov chat --model ov-plamo3 --system "日本語で簡潔に答えてください。"
+```
+
 主なオプション:
 
 - `--device CPU` / `GPU` / `NPU` / `AUTO` / `AUTO:GPU,CPU`
@@ -85,4 +101,5 @@ Get-Content prompt.txt | uv run plamo3-ov generate --stdin --model ov-plamo3
 - `--stream` / `--no-stream`
 - `--skip-prompt` / `--no-skip-prompt`
 
+各生成後に `FTTT`、生成トークン数、合計時間、`tokens/sec` をstderrへ表示します。
 推論には `openvino_genai.LLMPipeline` を使います。

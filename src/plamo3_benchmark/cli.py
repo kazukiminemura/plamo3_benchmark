@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import gc
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -447,76 +448,148 @@ def _sample_next_token(logits: Any, args: argparse.Namespace) -> int:
     return int(np.random.choice(np.arange(probs.shape[-1]), p=probs))
 
 
-def _generate_with_openvino_core(args: argparse.Namespace, prompt: str) -> int:
-    import numpy as np
-    import openvino as ov
+def _print_generation_metrics(token_count: int, start_time: float, first_token_time: float | None) -> None:
+    total_time = max(time.perf_counter() - start_time, 1e-9)
+    fttt_text = "n/a" if first_token_time is None else f"{first_token_time - start_time:.3f}s"
+    tokens_per_second = token_count / total_time if token_count else 0.0
+    print(
+        f"metrics: FTTT={fttt_text}, tokens={token_count}, total={total_time:.3f}s, "
+        f"tokens/sec={tokens_per_second:.2f}",
+        file=sys.stderr,
+    )
 
-    AutoTokenizer, _, _ = _import_transformers()
 
-    model_dir = Path(args.model)
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-    core = ov.Core()
-    ov_model = core.read_model(model_dir / "openvino_model.xml")
-    output = ov_model.output(0)
-    input_names = {item.get_any_name(): item for item in ov_model.inputs}
+class OpenVINOCoreGenerator:
+    def __init__(self, args: argparse.Namespace) -> None:
+        import openvino as ov
 
-    encoded = tokenizer(prompt, return_tensors="np")
-    input_ids = encoded["input_ids"].astype(np.int64)
-    prompt_len = int(input_ids.shape[1])
-    attention_mask = encoded["attention_mask"].astype(np.int64)
+        AutoTokenizer, _, _ = _import_transformers()
 
-    result_shape = list(output.get_partial_shape())
-    trace_len = result_shape[1].get_length() if len(result_shape) >= 2 and result_shape[1].is_static else prompt_len
-    if prompt_len + args.max_new_tokens > trace_len:
-        _die(
-            f"Prompt length ({prompt_len}) + max_new_tokens ({args.max_new_tokens}) exceeds "
-            f"the traced sequence length ({trace_len}). Re-run convert with a larger "
-            "`--max-seq-len`, for example `--max-seq-len 512`."
+        self.args = args
+        self.model_dir = Path(args.model)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir, trust_remote_code=True)
+        core = ov.Core()
+        ov_model = core.read_model(self.model_dir / "openvino_model.xml")
+        self.model_output = ov_model.output(0)
+        self.input_names = {item.get_any_name(): item for item in ov_model.inputs}
+
+        result_shape = list(self.model_output.get_partial_shape())
+        self.trace_len = (
+            result_shape[1].get_length()
+            if len(result_shape) >= 2 and result_shape[1].is_static
+            else None
         )
 
-    print(f"Using OpenVINO inference device: {args.device}", file=sys.stderr)
-    compiled = core.compile_model(ov_model, args.device)
-    output = compiled.output(0)
+        print(f"Using OpenVINO inference device: {args.device}", file=sys.stderr)
+        self.compiled = core.compile_model(ov_model, args.device)
+        self.compiled_output = self.compiled.output(0)
 
-    tokens = np.full((1, trace_len), tokenizer.pad_token_id or tokenizer.eos_token_id or 0, dtype=np.int64)
-    mask = np.zeros((1, trace_len), dtype=np.int64)
-    tokens[:, :prompt_len] = input_ids
-    mask[:, :prompt_len] = attention_mask
+    def generate(self, prompt: str, *, print_output: bool) -> str:
+        import numpy as np
 
-    generated: list[int] = []
-    eos_ids = {tokenizer.eos_token_id} if tokenizer.eos_token_id is not None else set()
+        encoded = self.tokenizer(prompt, return_tensors="np")
+        input_ids = encoded["input_ids"].astype(np.int64)
+        prompt_len = int(input_ids.shape[1])
+        attention_mask = encoded["attention_mask"].astype(np.int64)
+        trace_len = self.trace_len or prompt_len
 
-    if not args.skip_prompt:
-        print(prompt, end="" if args.stream else "\n")
+        if prompt_len + self.args.max_new_tokens > trace_len:
+            _die(
+                f"Prompt length ({prompt_len}) + max_new_tokens ({self.args.max_new_tokens}) exceeds "
+                f"the traced sequence length ({trace_len}). Re-run convert with a larger "
+                "`--max-seq-len`, for example `--max-seq-len 512`."
+            )
 
-    for position in range(prompt_len, min(trace_len, prompt_len + args.max_new_tokens)):
-        inputs = {
-            "input_ids": tokens,
-            "attention_mask": mask,
-        }
-        if "beam_idx" in input_names:
-            inputs["beam_idx"] = np.array([0], dtype=np.int32)
-        logits = compiled(inputs)[output][0, position - 1]
-        next_id = _sample_next_token(logits, args)
-        if next_id in eos_ids:
-            break
-        tokens[0, position] = next_id
-        mask[0, position] = 1
-        generated.append(next_id)
-        if args.stream:
-            print(tokenizer.decode([next_id], skip_special_tokens=True), end="", flush=True)
+        tokens = np.full(
+            (1, trace_len),
+            self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0,
+            dtype=np.int64,
+        )
+        mask = np.zeros((1, trace_len), dtype=np.int64)
+        tokens[:, :prompt_len] = input_ids
+        mask[:, :prompt_len] = attention_mask
 
-    if args.stream:
-        print()
-    else:
-        print(tokenizer.decode(generated, skip_special_tokens=True))
-    return 0
+        generated: list[int] = []
+        eos_ids = {self.tokenizer.eos_token_id} if self.tokenizer.eos_token_id is not None else set()
+        start_time = time.perf_counter()
+        first_token_time: float | None = None
+
+        if print_output and not self.args.skip_prompt:
+            print(prompt, end="" if self.args.stream else "\n")
+
+        for position in range(prompt_len, min(trace_len, prompt_len + self.args.max_new_tokens)):
+            inputs = {
+                "input_ids": tokens,
+                "attention_mask": mask,
+            }
+            if "beam_idx" in self.input_names:
+                inputs["beam_idx"] = np.array([0], dtype=np.int32)
+            logits = self.compiled(inputs)[self.compiled_output][0, position - 1]
+            next_id = _sample_next_token(logits, self.args)
+            if next_id in eos_ids:
+                break
+            if first_token_time is None:
+                first_token_time = time.perf_counter()
+            tokens[0, position] = next_id
+            mask[0, position] = 1
+            generated.append(next_id)
+            if self.args.stream and print_output:
+                print(self.tokenizer.decode([next_id], skip_special_tokens=True), end="", flush=True)
+
+        text = self.tokenizer.decode(generated, skip_special_tokens=True)
+        if self.args.stream and print_output:
+            print()
+        elif print_output:
+            print(text)
+        _print_generation_metrics(len(generated), start_time, first_token_time)
+        return text
 
 
-def generate(args: argparse.Namespace) -> int:
-    prompt = _read_prompt(args)
-    ov_genai = _import_openvino_genai()
+class OpenVINOGenAIGenerator:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        ov_genai = _import_openvino_genai()
+        try:
+            print(f"Using OpenVINO GenAI inference device: {args.device}", file=sys.stderr)
+            self.pipe = ov_genai.LLMPipeline(args.model, args.device)
+        except RuntimeError as exc:
+            _die(f"OpenVINO GenAI could not load the model directory: {exc}")
 
+    def generate(self, prompt: str, *, print_output: bool) -> str:
+        generation_kwargs = _sampling_kwargs(self.args)
+        generation_kwargs["echo"] = not self.args.skip_prompt
+        start_time = time.perf_counter()
+        first_token_time: float | None = None
+
+        chunks: list[str] = []
+
+        def streamer(token: str) -> bool:
+            nonlocal first_token_time
+            if first_token_time is None:
+                first_token_time = time.perf_counter()
+            if print_output and self.args.stream:
+                print(token, end="", flush=True)
+            chunks.append(token)
+            return False
+
+        try:
+            self.pipe.generate(prompt, streamer=streamer, **generation_kwargs)
+        except RuntimeError as exc:
+            _die(
+                "OpenVINO GenAI generation failed. If this model was produced by "
+                "`plamo3-ov convert`, it may not have the stateful KV-cache LLM graph "
+                f"that LLMPipeline expects. Original error: {exc}"
+            )
+        text = "".join(chunks)
+        if print_output and self.args.stream:
+            print()
+        elif print_output:
+            print(text)
+        _print_generation_metrics(len(chunks), start_time, first_token_time)
+        return text
+
+
+def _load_generator(args: argparse.Namespace) -> Any:
     model_source = args.model
     if not _looks_like_openvino_dir(model_source):
         _die(
@@ -524,44 +597,71 @@ def generate(args: argparse.Namespace) -> int:
             "Run `plamo3-ov convert --output-dir ov-plamo3` first."
         )
 
-    generation_kwargs = _sampling_kwargs(args)
-    generation_kwargs["echo"] = not args.skip_prompt
-
     has_openvino_tokenizer = (Path(model_source) / "openvino_tokenizer.xml").exists()
     if not has_openvino_tokenizer:
-        return _generate_with_openvino_core(args, prompt)
+        return OpenVINOCoreGenerator(args)
+    return OpenVINOGenAIGenerator(args)
 
-    try:
-        print(f"Using OpenVINO GenAI inference device: {args.device}", file=sys.stderr)
-        pipe = ov_genai.LLMPipeline(model_source, args.device)
-    except RuntimeError as exc:
-        _die(f"OpenVINO GenAI could not load the model directory: {exc}")
 
-    if args.stream:
-        def streamer(token: str) -> bool:
-            print(token, end="", flush=True)
-            return False
-
-        try:
-            pipe.generate(prompt, streamer=streamer, **generation_kwargs)
-        except RuntimeError as exc:
-            _die(
-                "OpenVINO GenAI generation failed. If this model was produced by "
-                "`plamo3-ov convert`, it may not have the stateful KV-cache LLM graph "
-                f"that LLMPipeline expects. Original error: {exc}"
-            )
-        print()
-        return 0
-
-    try:
-        print(pipe.generate(prompt, **generation_kwargs))
-    except RuntimeError as exc:
-        _die(
-            "OpenVINO GenAI generation failed. If this model was produced by "
-            "`plamo3-ov convert`, it may not have the stateful KV-cache LLM graph "
-            f"that LLMPipeline expects. Original error: {exc}"
-        )
+def generate(args: argparse.Namespace) -> int:
+    prompt = _read_prompt(args)
+    generator = _load_generator(args)
+    generator.generate(prompt, print_output=True)
     return 0
+
+
+def _format_chat_prompt(messages: list[dict[str, str]], system_prompt: str | None) -> str:
+    parts: list[str] = []
+    if system_prompt:
+        parts.append(f"System: {system_prompt.strip()}")
+    for message in messages:
+        role = "User" if message["role"] == "user" else "Assistant"
+        parts.append(f"{role}: {message['content'].strip()}")
+    parts.append("Assistant:")
+    return "\n".join(parts)
+
+
+def chat(args: argparse.Namespace) -> int:
+    if not _looks_like_openvino_dir(args.model):
+        _die(
+            f"{args.model!r} does not look like an exported OpenVINO model. "
+            "Run `plamo3-ov convert --output-dir ov-plamo3` first."
+        )
+
+    generator = _load_generator(args)
+    print(
+        "PLaMo 3 chat. Model is loaded once for this session. "
+        "Type /exit or /quit to leave, /reset to clear history.",
+        file=sys.stderr,
+    )
+    messages: list[dict[str, str]] = []
+    turns = 0
+    while True:
+        try:
+            user_text = input("you> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+
+        if not user_text:
+            continue
+        if user_text in {"/exit", "/quit"}:
+            return 0
+        if user_text == "/reset":
+            messages.clear()
+            turns = 0
+            print("history reset", file=sys.stderr)
+            continue
+
+        messages.append({"role": "user", "content": user_text})
+        prompt = _format_chat_prompt(messages, args.system)
+        print("assistant> ", end="", flush=True)
+        assistant_text = generator.generate(prompt, print_output=True).strip()
+        messages.append({"role": "assistant", "content": assistant_text})
+        turns += 1
+
+        if args.max_turns is not None and turns >= args.max_turns:
+            return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -630,6 +730,34 @@ def build_parser() -> argparse.ArgumentParser:
     generate_parser.add_argument("--stream", action=argparse.BooleanOptionalAction, default=True)
     generate_parser.add_argument("--skip-prompt", action=argparse.BooleanOptionalAction, default=True)
     generate_parser.set_defaults(func=generate)
+
+    chat_parser = subparsers.add_parser(
+        "chat",
+        help="Chat interactively with an exported OpenVINO model.",
+    )
+    chat_parser.add_argument(
+        "--model",
+        default="ov-plamo3",
+        help="Path to an OpenVINO GenAI model directory.",
+    )
+    chat_parser.add_argument(
+        "--device",
+        default="CPU",
+        help=(
+            "OpenVINO inference device, such as CPU, GPU, NPU, AUTO, GPU.0, "
+            "or AUTO:GPU,CPU. Default: CPU."
+        ),
+    )
+    chat_parser.add_argument("--system", help="Optional system prompt prepended to the chat history.")
+    chat_parser.add_argument("--max-turns", type=int, help="Exit after this many user turns.")
+    chat_parser.add_argument("--max-new-tokens", type=int, default=128)
+    chat_parser.add_argument("--temperature", type=float, default=0.8)
+    chat_parser.add_argument("--top-p", type=float, default=0.95)
+    chat_parser.add_argument("--top-k", type=int, default=50)
+    chat_parser.add_argument("--repetition-penalty", type=float, default=1.0)
+    chat_parser.add_argument("--stream", action=argparse.BooleanOptionalAction, default=True)
+    chat_parser.add_argument("--skip-prompt", action=argparse.BooleanOptionalAction, default=True)
+    chat_parser.set_defaults(func=chat)
 
     return parser
 
