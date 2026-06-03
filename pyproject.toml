@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "plamo3-benchmark"
+version = "0.1.0"
+description = "OpenVINO CLI inference for pfnet/plamo-3-nict-8b-base"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "openvino-genai>=2026.1.0",
+  "openvino>=2026.1.0",
+  "transformers>=4.56.0,<=4.57.1",
+  "torch>=2.6.0,<=2.9.0",
+  "numpy>=1.26.4",
+  "numba>=0.60.0",
+  "huggingface-hub>=0.30.0",
+]
+
+[project.scripts]
+plamo3-ov = "plamo3_benchmark.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/plamo3_benchmark"]
