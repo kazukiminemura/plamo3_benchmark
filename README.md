@@ -7,6 +7,44 @@ base model です。モデルライセンスを確認し、必要に応じて Hu
 このモデルは gated repo なので、先に https://huggingface.co/pfnet/plamo-3-nict-8b-base
 でアクセス申請またはライセンス同意を済ませます。
 
+## アーキテクチャ
+
+```mermaid
+flowchart TD
+    User["User / PowerShell"] --> CLI["plamo3-ov CLI<br/>cli.py"]
+
+    CLI --> ConvertCmd["convert command"]
+    CLI --> GenerateCmd["generate command"]
+    CLI --> ChatCmd["chat command"]
+
+    ConvertCmd --> ModelConvert["model_convert.py"]
+    ModelConvert --> HFModel["Hugging Face<br/>pfnet/plamo-3-nict-8b-base"]
+    ModelConvert --> HFTokenizer["Hugging Face tokenizer<br/>Plamo3Tokenizer"]
+    ModelConvert --> OVConvert["openvino.convert_model"]
+    ModelConvert --> GQAPatch["GQA SDPA patch<br/>K/V head expansion"]
+    ModelConvert --> NNCF["NNCF weight compression<br/>fp16 / int8 / int4"]
+    ModelConvert --> OVTokenizer["openvino-tokenizers<br/>if supported"]
+    ModelConvert --> Artifact["OpenVINO model directory<br/>openvino_model.xml/bin<br/>tokenizer/config files"]
+
+    HFModel --> OVConvert
+    GQAPatch --> OVConvert
+    OVConvert --> NNCF
+    NNCF --> Artifact
+    HFTokenizer --> OVTokenizer
+    HFTokenizer --> Artifact
+    OVTokenizer --> Artifact
+
+    GenerateCmd --> Inference["inference.py"]
+    ChatCmd --> Inference
+    Inference --> Loader{"openvino_tokenizer.xml<br/>exists?"}
+    Loader -->|"yes"| GenAI["OpenVINO GenAI<br/>LLMPipeline"]
+    Loader -->|"no"| CoreFallback["OpenVINO Core fallback<br/>HF tokenizer"]
+    Artifact --> Loader
+    GenAI --> Metrics["Output + metrics<br/>FTTT / tokens/sec"]
+    CoreFallback --> Metrics
+    Metrics --> User
+```
+
 ## セットアップ
 
 ```powershell
