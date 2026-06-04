@@ -882,6 +882,7 @@ name = "plamo3-benchmark"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "hf-xet" },
     { name = "huggingface-hub" },
     { name = "nncf" },
     { name = "numba" },
@@ -895,6 +896,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "hf-xet", specifier = ">=1.0.0" },
     { name = "huggingface-hub", specifier = ">=0.30.0" },
     { name = "nncf", specifier = ">=3.0.0" },
     { name = "numba", specifier = ">=0.60.0" },

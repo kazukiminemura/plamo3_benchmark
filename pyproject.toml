@@ -17,6 +17,7 @@ dependencies = [
   "numpy>=1.26.4",
   "numba>=0.60.0",
   "huggingface-hub>=0.30.0",
+  "hf-xet>=1.0.0",
 ]
 
 [project.scripts]

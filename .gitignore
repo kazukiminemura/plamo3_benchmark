@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 
 ov-plamo3/
+ov-plamo3-*/
 tmp-*-ov/
 *.xml
 *.bin

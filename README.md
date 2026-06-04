@@ -13,6 +13,8 @@ base model です。モデルライセンスを確認し、必要に応じて Hu
 uv sync
 ```
 
+モデルファイルのダウンロードには Hugging Face Xet Storage を使うため、依存に `hf-xet` を含めています。
+
 Hugging Face 認証が必要な場合:
 
 ```powershell
@@ -43,17 +45,18 @@ generator を使います。
 uv run plamo3-ov convert --output-dir ov-plamo3 --weight-format fp16 --max-seq-len 512
 ```
 
-`--weight-format` は `fp16`、`fp32`、`int8` を指定できます。`int8` は NNCF の
-`INT8_ASYM` weight compression を OpenVINO IR に適用します。INT4圧縮はこの非Optimumルートでは
-提供していません。
+`--weight-format` は `fp16`、`fp32`、`int8`、`int4` を指定できます。`int8` は NNCF の
+`INT8_ASYM`、`int4` は NNCF の `INT4_ASYM` weight compression を OpenVINO IR に適用します。
 既に `openvino_model.xml` がある場合、`convert` は本体IRを再利用して tokenizer/config だけ補完します。
-`--weight-format int8` で既存の非INT8 IRを置き換える場合は、Windowsのファイルロックを避けるため
+`--weight-format int8` または `--weight-format int4` で既存の別形式IRを置き換える場合は、Windowsのファイルロックを避けるため
 `--force` を付けてPyTorchから作り直すか、別の出力ディレクトリを使います。
 
 ```powershell
 uv run plamo3-ov convert --output-dir ov-plamo3-int8 --weight-format int8 --max-seq-len 512
+uv run plamo3-ov convert --output-dir ov-plamo3-int4 --weight-format int4 --max-seq-len 512
 # 既存ディレクトリへ作り直す場合
 uv run plamo3-ov convert --output-dir ov-plamo3 --weight-format int8 --max-seq-len 512 --force
+uv run plamo3-ov convert --output-dir ov-plamo3 --weight-format int4 --max-seq-len 512 --force
 ```
 
 ## 推論

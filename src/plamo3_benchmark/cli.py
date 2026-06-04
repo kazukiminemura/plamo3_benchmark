@@ -62,11 +62,12 @@ def _import_openvino_converter() -> tuple[Any, Any]:
 
 def _import_nncf() -> tuple[Any, Any]:
     try:
-        from nncf import CompressWeightsMode, compress_weights
+        from nncf import CompressWeightsMode, GroupSizeFallbackMode, compress_weights
+        from nncf.quantization.advanced_parameters import AdvancedCompressionParameters
     except ImportError as exc:
         _die("NNCF is required for INT8 weight compression. Run `uv sync` first.")
         raise exc
-    return compress_weights, CompressWeightsMode
+    return compress_weights, CompressWeightsMode, GroupSizeFallbackMode, AdvancedCompressionParameters
 
 
 def _read_prompt(args: argparse.Namespace) -> str:
@@ -222,12 +223,20 @@ def _try_save_openvino_tokenizer(tokenizer: Any, ov: Any, openvino_tokenizers: A
 
 
 def _apply_weight_compression(ov_model: Any, weight_format: str) -> Any:
-    if weight_format != "int8":
+    if weight_format not in {"int8", "int4"}:
         return ov_model
 
-    compress_weights, CompressWeightsMode = _import_nncf()
-    print("Compressing OpenVINO model weights to INT8_ASYM with NNCF...", file=sys.stderr)
-    return compress_weights(ov_model, mode=CompressWeightsMode.INT8_ASYM)
+    compress_weights, CompressWeightsMode, GroupSizeFallbackMode, AdvancedCompressionParameters = _import_nncf()
+    if weight_format == "int8":
+        mode = CompressWeightsMode.INT8_ASYM
+        advanced_parameters = None
+    else:
+        mode = CompressWeightsMode.INT4_ASYM
+        advanced_parameters = AdvancedCompressionParameters(
+            group_size_fallback_mode=GroupSizeFallbackMode.ADJUST
+        )
+    print(f"Compressing OpenVINO model weights to {mode} with NNCF...", file=sys.stderr)
+    return compress_weights(ov_model, mode=mode, advanced_parameters=advanced_parameters)
 
 
 def _save_openvino_model(ov: Any, ov_model: Any, xml_path: Path, *, compress_to_fp16: bool) -> None:
@@ -261,9 +270,9 @@ def convert(args: argparse.Namespace) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     _check_hugging_face_access(args.model)
 
-    if args.weight_format not in {"fp32", "fp16", "int8"}:
+    if args.weight_format not in {"fp32", "fp16", "int8", "int4"}:
         _die(
-            "This OpenVINO GenAI conversion path supports --weight-format fp32, fp16, or int8."
+            "This OpenVINO GenAI conversion path supports --weight-format fp32, fp16, int8, or int4."
         )
 
     AutoTokenizer, _, _ = _import_transformers()
@@ -274,12 +283,12 @@ def convert(args: argparse.Namespace) -> int:
     if existing_model.exists() and not args.force:
         print(f"Reusing existing OpenVINO model: {existing_model}", file=sys.stderr)
         existing_info = _read_conversion_info(output_dir)
-        if args.weight_format == "int8" and existing_info.get("weight_format") != "int8":
+        if args.weight_format in {"int8", "int4"} and existing_info.get("weight_format") != args.weight_format:
             _die(
-                "openvino_model.xml already exists and is not marked as INT8. "
+                f"openvino_model.xml already exists and is not marked as {args.weight_format.upper()}. "
                 "On Windows, in-place compression can leave the existing .bin locked. "
-                "Re-run with `--force` to rebuild and save INT8, or use a new "
-                "--output-dir such as `ov-plamo3-int8`."
+                f"Re-run with `--force` to rebuild and save {args.weight_format.upper()}, or use a new "
+                f"--output-dir such as `ov-plamo3-{args.weight_format}`."
             )
 
         _save_tokenizer_and_configs(tokenizer, args.model, output_dir)
@@ -335,7 +344,7 @@ def convert(args: argparse.Namespace) -> int:
                 return_dict=False,
             )[0]
 
-    dtype = torch.float16 if args.weight_format in {"fp16", "int8"} else torch.float32
+    dtype = torch.float16 if args.weight_format in {"fp16", "int8", "int4"} else torch.float32
     print("Loading Hugging Face model with trust_remote_code=True...", file=sys.stderr)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
@@ -680,8 +689,11 @@ def build_parser() -> argparse.ArgumentParser:
     convert_parser.add_argument(
         "--weight-format",
         default="fp16",
-        choices=["fp32", "fp16", "int8"],
-        help="OpenVINO save precision. int8 applies NNCF INT8_ASYM weight compression.",
+        choices=["fp32", "fp16", "int8", "int4"],
+        help=(
+            "OpenVINO save precision. int8 applies NNCF INT8_ASYM weight compression; "
+            "int4 applies NNCF INT4_ASYM weight compression."
+        ),
     )
     convert_parser.add_argument("--example-prompt", help="Prompt used to trace the PyTorch model.")
     convert_parser.add_argument(
