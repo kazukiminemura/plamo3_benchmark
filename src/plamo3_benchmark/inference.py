@@ -195,16 +195,23 @@ class OpenVINOGenerator:
             layers = int(self.info["num_hidden_layers"])
             kv_heads = int(self.info["num_key_value_heads"])
             head_dim = int(self.info["head_dim"])
+            past_len = int(self.info["kv_cache_past_length"])
         except KeyError as exc:
             die(f"KV-cache model metadata is missing {exc.args[0]!r}; re-run convert with `--force`.")
         return {
             f"past.{layer_idx}.{kind}": np.zeros(
-                (1, kv_heads, 0, head_dim),
+                (1, kv_heads, past_len, head_dim),
                 dtype=self.input_dtypes.get(f"past.{layer_idx}.{kind}", np.float32),
             )
             for layer_idx in range(layers)
             for kind in ("key", "value")
         }
+
+    @staticmethod
+    def _kv_attention_mask(np: Any, context_len: int, active_tokens: int, dtype: Any) -> Any:
+        mask = np.zeros((1, context_len), dtype=dtype)
+        mask[:, -min(active_tokens, context_len) :] = 1
+        return mask
 
     def _present_to_past(self, result: Any) -> dict[str, Any]:
         cache = {}
@@ -222,27 +229,36 @@ class OpenVINOGenerator:
         input_dtype = self.input_dtypes.get("input_ids", np.int64)
         mask_dtype = self.input_dtypes.get("attention_mask", input_dtype)
         input_ids = encoded["input_ids"].astype(input_dtype)
-        prompt_len = int(input_ids.shape[1])
 
         if print_output and not self.args.skip_prompt:
             print(prompt, end="" if self.args.stream else "\n")
 
         start_time = time.perf_counter()
-        inputs = {
-            "input_ids": input_ids,
-            "attention_mask": np.ones((1, prompt_len), dtype=mask_dtype),
-            **self._empty_cache(np),
-        }
-        result = self.compiled(inputs)
-        logits = result[self.compiled_output][0, -1]
-        cache = self._present_to_past(result)
+        context_len = int(self.info.get("kv_cache_context_length", self.info.get("trace_sequence_length", 0)))
+        if context_len <= 1:
+            die("KV-cache model metadata has an invalid context length; re-run convert with `--force`.")
+        cache = self._empty_cache(np)
+        logits = None
+        processed_tokens = 0
+        for token_id in input_ids[0].tolist():
+            processed_tokens += 1
+            result = self.compiled(
+                {
+                    "input_ids": np.array([[token_id]], dtype=input_dtype),
+                    "attention_mask": self._kv_attention_mask(np, context_len, processed_tokens, mask_dtype),
+                    **cache,
+                }
+            )
+            logits = result[self.compiled_output][0, -1]
+            cache = self._present_to_past(result)
 
         generated: list[int] = []
         eos_ids = {self.tokenizer.eos_token_id} if self.tokenizer.eos_token_id is not None else set()
         first_token_time: float | None = None
-        total_len = prompt_len
 
         for step in range(self.args.max_new_tokens):
+            if logits is None:
+                break
             next_id = _sample_next_token(logits, self.args)
             if next_id in eos_ids:
                 break
@@ -254,11 +270,11 @@ class OpenVINOGenerator:
 
             if step == self.args.max_new_tokens - 1:
                 break
-            total_len += 1
+            processed_tokens += 1
             result = self.compiled(
                 {
                     "input_ids": np.array([[next_id]], dtype=input_dtype),
-                    "attention_mask": np.ones((1, total_len), dtype=mask_dtype),
+                    "attention_mask": self._kv_attention_mask(np, context_len, processed_tokens, mask_dtype),
                     **cache,
                 }
             )

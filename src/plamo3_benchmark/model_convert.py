@@ -227,29 +227,110 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
             )[0]
 
     class KVLogits(nn.Module):
-        def __init__(self, model: nn.Module, layers: int) -> None:
+        def __init__(self, model: nn.Module, layers: int, past_len: int) -> None:
             super().__init__()
             self.model = model
             self.layers = layers
+            self.past_len = past_len
+            module = __import__(model.__class__.__module__, fromlist=["_rotary_pos_emb", "swa_mask"])
+            self.rotary_pos_emb = module._rotary_pos_emb
+            self.swa_mask = module.swa_mask
+
+        def attention(
+            self,
+            mixer: nn.Module,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor,
+            past_key: torch.Tensor,
+            past_value: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            import torch.nn.functional as F
+
+            bsz, q_len, _ = hidden_states.size()
+            qkv = mixer.qkv_proj(hidden_states)
+            query_states, key_states, value_states = torch.split(
+                qkv, [mixer.q_proj_dim, mixer.k_proj_dim, mixer.v_proj_dim], dim=-1
+            )
+            query_states = query_states.view(bsz, q_len, mixer.q_num_heads, mixer.qk_dim).transpose(1, 2)
+            key_states = key_states.view(bsz, q_len, mixer.k_num_heads, mixer.qk_dim).transpose(1, 2)
+            value_states = value_states.view(bsz, q_len, mixer.v_num_heads, mixer.v_dim).transpose(1, 2)
+
+            attn_dtype = query_states.dtype
+            query_states = mixer.q_norm(query_states)
+            key_states = mixer.k_norm(key_states)
+            key_states = torch.cat((past_key, key_states), dim=-2)
+            value_states = torch.cat((past_value, value_states), dim=-2)
+
+            kv_seq_len = key_states.shape[-2]
+            position_ids = torch.arange(kv_seq_len, dtype=torch.long, device=hidden_states.device)[None]
+            q_position_ids = position_ids[:, -query_states.shape[2] :]
+            cos, sin = mixer.rotary_emb(value_states, seq_len=kv_seq_len)
+            query_states = self.rotary_pos_emb(query_states, cos, sin, q_position_ids).to(attn_dtype)
+            key_states = self.rotary_pos_emb(key_states, cos, sin, position_ids).to(attn_dtype)
+            value_states = value_states.to(attn_dtype)
+
+            if attention_mask.dtype != torch.bool:
+                attention_mask = attention_mask.to(attn_dtype)
+            if attention_mask.dtype == torch.bool:
+                attention_mask = torch.where(attention_mask, torch.tensor(0.0, dtype=torch.float), float("-inf"))
+            if len(attention_mask.shape) == 2:
+                attention_mask = attention_mask[None, None]
+            if not mixer.full_attn:
+                m_swa = self.swa_mask(
+                    query_states.shape[2], key_states.shape[2], query_states.device, mixer.config.window_size
+                )
+                attention_mask = attention_mask[:, :, -query_states.shape[2] :, -key_states.shape[2] :]
+                attention_mask = torch.where(m_swa[None, None], attention_mask, float("-inf"))
+
+            bool_mask = torch.logical_not(torch.isneginf(attention_mask))
+            valid_tokens = torch.sum(bool_mask, dim=-1).bool()
+            attention_mask = torch.where(valid_tokens[..., None], attention_mask, float(0.0))
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=attention_mask,
+                enable_gqa=True,
+            )
+            attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, mixer.q_num_heads * mixer.v_dim)
+            attn_output = mixer.o_proj(attn_output)
+            if not mixer.full_attn:
+                key_states = key_states[:, :, -mixer.config.window_size :, :]
+                value_states = value_states[:, :, -mixer.config.window_size :, :]
+            return attn_output, key_states[:, :, -self.past_len :, :], value_states[:, :, -self.past_len :, :]
 
         def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, *past: torch.Tensor) -> tuple[Any, ...]:
-            from transformers.cache_utils import DynamicCache
-
-            cache = DynamicCache()
-            for layer_idx in range(self.layers):
-                cache.update(past[layer_idx * 2], past[layer_idx * 2 + 1], layer_idx)
-            out = self.model(
-                input_ids=input_ids.to(torch.long),
-                attention_mask=attention_mask.to(torch.long),
-                past_key_values=cache,
-                use_cache=True,
-                return_dict=True,
+            base = self.model.model
+            inputs_embeds = base.embed_tokens(input_ids.to(torch.long))
+            bsz, seq_len, _ = inputs_embeds.shape
+            past_len = past[0].shape[2]
+            cache_position = torch.arange(past_len, past_len + seq_len, device=inputs_embeds.device)
+            attention_mask = base._prepare_decoder_attention_mask(
+                attention_mask.to(torch.long),
+                (bsz, seq_len),
+                inputs_embeds,
+                cache_position,
             )
+
+            hidden_states = inputs_embeds
             flat_cache = []
-            for layer_idx in range(self.layers):
-                key, value = out.past_key_values[layer_idx]
+            for layer_idx, layer in enumerate(base.layers.layers):
+                residual = hidden_states
+                hidden_states = layer.pre_mixer_norm(hidden_states)
+                attn_out, key, value = self.attention(
+                    layer.mixer,
+                    hidden_states,
+                    attention_mask,
+                    past[layer_idx * 2],
+                    past[layer_idx * 2 + 1],
+                )
+                hidden_states = residual + layer.post_mixer_norm(attn_out)
+                residual = hidden_states
+                hidden_states = residual + layer.post_mlp_norm(layer.mlp(layer.pre_mlp_norm(hidden_states)))
                 flat_cache.extend([key, value])
-            return (out.logits, *flat_cache)
+
+            logits = self.model.lm_head(base.norm(hidden_states))
+            return (logits, *flat_cache)
 
     weight_format = _weight_format(args)
     npu = _is_npu(args.target_device)
@@ -267,9 +348,12 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
 
     token_dtype = torch.int32 if npu else torch.long
     if args.kv_cache:
+        if args.max_seq_len is None:
+            args.max_seq_len = 1024
+            print("KV-cache export requested; using --max-seq-len 1024.", file=sys.stderr)
         encoded = {
             "input_ids": torch.tensor([[tokenizer.bos_token_id or 1]], dtype=token_dtype),
-            "attention_mask": torch.ones((1, 1), dtype=token_dtype),
+            "attention_mask": torch.tensor([[0] * (args.max_seq_len - 1) + [1]], dtype=token_dtype),
         }
     else:
         if args.max_seq_len is None:
@@ -288,8 +372,9 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
         layers = int(getattr(model.config, "num_hidden_layers"))
         kv_heads = int(getattr(model.config, "num_key_value_heads"))
         head_dim = int(getattr(model.config, "head_dim"))
-        example_past = tuple(torch.zeros((1, kv_heads, 0, head_dim), dtype=dtype) for _ in range(layers * 2))
-        wrapped_model = KVLogits(model, layers).eval()
+        past_len = int(args.max_seq_len) - 1
+        example_past = tuple(torch.zeros((1, kv_heads, past_len, head_dim), dtype=dtype) for _ in range(layers * 2))
+        wrapped_model = KVLogits(model, layers, past_len).eval()
         example_input = (encoded["input_ids"], encoded["attention_mask"], *example_past)
     else:
         wrapped_model = LogitsOnly(model).eval()
@@ -308,12 +393,12 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
     trace_len = int(encoded["input_ids"].shape[1])
     if args.kv_cache:
         shapes = {
-            "input_ids": ov.PartialShape([1, -1]),
-            "attention_mask": ov.PartialShape([1, -1]),
+            "input_ids": ov.PartialShape([1, 1]),
+            "attention_mask": ov.PartialShape([1, args.max_seq_len]),
         }
         for layer_idx in range(layers):
-            shapes[f"past.{layer_idx}.key"] = ov.PartialShape([1, kv_heads, -1, head_dim])
-            shapes[f"past.{layer_idx}.value"] = ov.PartialShape([1, kv_heads, -1, head_dim])
+            shapes[f"past.{layer_idx}.key"] = ov.PartialShape([1, kv_heads, past_len, head_dim])
+            shapes[f"past.{layer_idx}.value"] = ov.PartialShape([1, kv_heads, past_len, head_dim])
         for idx, input_node in enumerate(ov_model.inputs[2:]):
             input_node.get_tensor().set_names({f"past.{idx // 2}.{'key' if idx % 2 == 0 else 'value'}"})
         for idx, output_node in enumerate(ov_model.outputs[1:]):
@@ -351,6 +436,8 @@ def _conversion_info(args: Any, weight_format: str, trace_len: int | None, *, us
         "uses_kv_cache": uses_kv_cache,
     }
     if uses_kv_cache:
+        info["kv_cache_context_length"] = int(args.max_seq_len)
+        info["kv_cache_past_length"] = int(args.max_seq_len) - 1
         config_path = Path(args.output_dir) / "config.json"
         try:
             config = json.loads(config_path.read_text(encoding="utf-8"))

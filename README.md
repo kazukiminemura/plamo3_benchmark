@@ -231,8 +231,9 @@ PLaMo 3 を変換します。
 PLaMo 3 の GQA attention は、変換時だけ K/V heads を明示的に展開して OpenVINO の
 `ScaledDotProductAttention` に渡します。
 
-推論では OpenVINO Core と Hugging Face tokenizer を組み合わせます。既定では KV cache 付き
-IR を使い、prompt は一度だけ prefill して、その後は 1 token ずつ生成します。
+推論では OpenVINO Core と Hugging Face tokenizer を組み合わせます。既定では `--max-seq-len`
+を固定コンテキスト長にした KV cache 付き IR を使い、prompt も生成tokenも 1 token ずつ
+cache に流します。
 既存の非 KV cache IR を KV cache 付きに作り直す場合は、同じ `--output-dir` に対して
 `--force` を付けて再変換してください。
 `--no-kv-cache` で変換した場合は、`--max-seq-len` で変換した固定長の範囲内で生成します。
