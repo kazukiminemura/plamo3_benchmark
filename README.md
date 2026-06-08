@@ -1,11 +1,33 @@
 # plamo3_benchmark
 
-`pfnet/plamo-3-nict-8b-base` を OpenVINO GenAI で推論するための Python CLI です。
+`pfnet/plamo-3-nict-8b-base` を OpenVINO / OpenVINO GenAI で動かすための
+Python CLI です。Hugging Face 上の PLaMo 3 NICT 8B Base を OpenVINO IR に変換し、
+テキスト生成や簡易チャットを実行できます。
 
-PLaMo 3 NICT 8B Base は Hugging Face 上で `trust_remote_code=True` が必要な
-base model です。モデルライセンスを確認し、必要に応じて Hugging Face にログインしてから使ってください。
-このモデルは gated repo なので、先に https://huggingface.co/pfnet/plamo-3-nict-8b-base
-でアクセス申請またはライセンス同意を済ませます。
+## できること
+
+- Hugging Face の PLaMo 3 NICT 8B Base を OpenVINO IR へ変換
+- `fp32` / `fp16` / `int8` / `int4` の weight format を指定
+- CPU / GPU / NPU / AUTO などの OpenVINO device string で推論
+- 位置引数、ファイル、標準入力からプロンプトを投入
+- CLI 上での対話チャット
+- 生成ごとの FTTT、生成トークン数、合計時間、tokens/sec の表示
+
+## 前提
+
+- Python 3.10 以上
+- `uv`
+- Hugging Face アカウント
+- `pfnet/plamo-3-nict-8b-base` へのアクセス権
+
+PLaMo 3 NICT 8B Base は gated repo です。先にモデルページでアクセス申請または
+ライセンス同意を済ませてください。
+
+https://huggingface.co/pfnet/plamo-3-nict-8b-base
+
+このモデルは Hugging Face の custom code を使うため、CLI は既定で
+`trust_remote_code=True` を指定します。利用前にモデルライセンスとコードの内容を
+確認してください。
 
 ## アーキテクチャ
 
@@ -51,96 +73,154 @@ flowchart TD
 uv sync
 ```
 
-モデルファイルのダウンロードには Hugging Face Xet Storage を使うため、依存に `hf-xet` を含めています。
+モデルファイルのダウンロードには Hugging Face Xet Storage を使うため、依存に
+`hf-xet` を含めています。
 
-Hugging Face 認証が必要な場合:
+Hugging Face 認証が必要な場合は、どちらかの方法でログインします。
 
 ```powershell
 uv run huggingface-cli login
 ```
 
-または PowerShell でトークンを渡します。
-
 ```powershell
 $env:HF_TOKEN="<your-token>"
 ```
 
-## OpenVINO 形式へ変換
+## クイックスタート
 
-この CLI は `optimum-intel` を使わず、`openvino.convert_model` と `openvino-tokenizers` で
-OpenVINO GenAI が読むディレクトリを作ります。
-
-PLaMo 3 は Hugging Face の custom code モデルなので、この変換ルートは実験的です。
-OpenVINO GenAI の公式ドキュメントでは、Hugging Face LLM の一般的なIR変換には
-`optimum-cli export openvino` が案内されていますが、PLaMo 3 はその exporter でも未対応です。
-PLaMo 3 の GQA attention は、変換時だけ K/V heads を明示的に展開して OpenVINO の
-`ScaledDotProductAttention` に渡します。
-PLaMo 3 tokenizer は custom Python tokenizer のため `openvino-tokenizers` では変換できません。
-その場合は Hugging Face tokenizer を保存し、推論時に OpenVINO Core + HF tokenizer の fallback
-generator を使います。
+まず OpenVINO 形式へ変換します。
 
 ```powershell
 uv run plamo3-ov convert --output-dir ov-plamo3 --weight-format fp16 --max-seq-len 512
 ```
 
-`--weight-format` は `fp16`、`fp32`、`int8`、`int4` を指定できます。`int8` は NNCF の
-`INT8_ASYM`、`int4` は NNCF の `INT4_ASYM` weight compression を OpenVINO IR に適用します。
-既に `openvino_model.xml` がある場合、`convert` は本体IRを再利用して tokenizer/config だけ補完します。
-`--weight-format int8` または `--weight-format int4` で既存の別形式IRを置き換える場合は、Windowsのファイルロックを避けるため
-`--force` を付けてPyTorchから作り直すか、別の出力ディレクトリを使います。
-
-```powershell
-uv run plamo3-ov convert --output-dir ov-plamo3-int8 --weight-format int8 --max-seq-len 512
-uv run plamo3-ov convert --output-dir ov-plamo3-int4 --weight-format int4 --max-seq-len 512
-# 既存ディレクトリへ作り直す場合
-uv run plamo3-ov convert --output-dir ov-plamo3 --weight-format int8 --max-seq-len 512 --force
-uv run plamo3-ov convert --output-dir ov-plamo3 --weight-format int4 --max-seq-len 512 --force
-```
-
-## 推論
+変換したモデルで生成します。
 
 ```powershell
 uv run plamo3-ov generate "これからの人工知能技術は" --model ov-plamo3 --max-new-tokens 128
 ```
 
-推論デバイスは `--device` で指定できます。OpenVINO の device string をそのまま渡せます。
+チャットを始める場合:
+
+```powershell
+uv run plamo3-ov chat --model ov-plamo3 --device CPU --max-new-tokens 128
+```
+
+## OpenVINO 形式への変換
+
+この CLI は `optimum-intel` ではなく、`openvino.convert_model` と
+`openvino-tokenizers` を使って OpenVINO 用のモデルディレクトリを作ります。
+
+```powershell
+uv run plamo3-ov convert --output-dir ov-plamo3 --weight-format fp16 --max-seq-len 512
+```
+
+主なオプション:
+
+- `--model`: 変換元モデル。既定は `pfnet/plamo-3-nict-8b-base`
+- `--output-dir`: 変換後のモデルディレクトリ
+- `--weight-format`: `fp32`、`fp16`、`int8`、`int4`
+- `--max-seq-len`: 変換時に使う固定シーケンス長
+- `--example-prompt`: tracing に使うプロンプト
+- `--force`: 既存の `openvino_model.xml` があっても再変換
+- `--trust-remote-code` / `--no-trust-remote-code`: custom code の許可
+
+`int8` は NNCF の `INT8_ASYM`、`int4` は NNCF の `INT4_ASYM` weight compression を
+OpenVINO IR に適用します。
+
+```powershell
+uv run plamo3-ov convert --output-dir ov-plamo3-int8 --weight-format int8 --max-seq-len 512
+uv run plamo3-ov convert --output-dir ov-plamo3-int4 --weight-format int4 --max-seq-len 512
+```
+
+既存ディレクトリに `openvino_model.xml` がある場合、`convert` はモデル本体を再利用し、
+tokenizer と config を補完します。既存の別形式 IR を `int8` または `int4` に置き換える場合は、
+Windows のファイルロックを避けるため `--force` を付けるか、別の出力ディレクトリを
+使ってください。
+
+```powershell
+uv run plamo3-ov convert --output-dir ov-plamo3 --weight-format int8 --max-seq-len 512 --force
+uv run plamo3-ov convert --output-dir ov-plamo3 --weight-format int4 --max-seq-len 512 --force
+```
+
+## テキスト生成
+
+```powershell
+uv run plamo3-ov generate "これからの人工知能技術は" --model ov-plamo3
+```
+
+デバイスは `--device` で指定できます。OpenVINO の device string をそのまま渡します。
 
 ```powershell
 uv run plamo3-ov generate "これからの人工知能技術は" --model ov-plamo3 --device CPU
 uv run plamo3-ov generate "これからの人工知能技術は" --model ov-plamo3-int8 --device GPU
-uv run plamo3-ov generate "これからの人工知能技術は" --model ov-plamo3-int8 --device AUTO:GPU,CPU
+uv run plamo3-ov generate "これからの人工知能技術は" --model ov-plamo3-int4 --device AUTO:GPU,CPU
 ```
 
-ファイルや標準入力からもプロンプトを渡せます。
+ファイルまたは標準入力からプロンプトを渡すこともできます。
 
 ```powershell
 uv run plamo3-ov generate --prompt-file prompt.txt --model ov-plamo3
 Get-Content prompt.txt | uv run plamo3-ov generate --stdin --model ov-plamo3
 ```
 
+生成オプション:
+
+- `--max-new-tokens 128`
+- `--temperature 0.8`
+- `--top-p 0.95`
+- `--top-k 50`
+- `--repetition-penalty 1.0`
+- `--stream` / `--no-stream`
+- `--skip-prompt` / `--no-skip-prompt`
+
+`--temperature 0` を指定すると greedy decoding になります。
+
 ## チャット
 
-CLI上で対話するには `chat` を使います。
+CLI 上で対話するには `chat` を使います。起動時にモデルを一度だけロードし、同じ
+セッション内の各ターンで再利用します。
 
 ```powershell
-uv run plamo3-ov chat --model ov-plamo3-int8 --device GPU --max-new-tokens 128
+uv run plamo3-ov chat --model ov-plamo3-int4 --device GPU --max-new-tokens 128
 ```
 
-`chat` は起動時にモデルを一度だけロードし、同じセッション内の各ターンで再利用します。
-チャット中は `/exit` または `/quit` で終了、`/reset` で履歴をクリアできます。
+チャット中のコマンド:
+
+- `/exit` または `/quit`: 終了
+- `/reset`: 会話履歴をクリア
+
 システムプロンプトを付ける場合:
 
 ```powershell
 uv run plamo3-ov chat --model ov-plamo3 --system "日本語で簡潔に答えてください。"
 ```
 
-主なオプション:
+## 変換ルートの注意点
 
-- `--device CPU` / `GPU` / `NPU` / `AUTO` / `AUTO:GPU,CPU`
-- `--temperature 0` で greedy decoding
-- `--top-p 0.95 --top-k 50`
-- `--stream` / `--no-stream`
-- `--skip-prompt` / `--no-skip-prompt`
+PLaMo 3 は Hugging Face の custom code モデルです。このリポジトリの変換ルートは
+実験的です。
 
-各生成後に `FTTT`、生成トークン数、合計時間、`tokens/sec` をstderrへ表示します。
-推論には `openvino_genai.LLMPipeline` を使います。
+OpenVINO GenAI の公式ドキュメントでは、Hugging Face LLM の一般的な IR 変換に
+`optimum-cli export openvino` が案内されています。ただし、PLaMo 3 は現時点では
+その exporter でも未対応のため、この CLI では `openvino.convert_model` を直接使います。
+
+PLaMo 3 の GQA attention は、変換時だけ K/V heads を明示的に展開して OpenVINO の
+`ScaledDotProductAttention` に渡します。
+
+PLaMo 3 tokenizer は custom Python tokenizer のため、`openvino-tokenizers` で変換できない
+場合があります。その場合は Hugging Face tokenizer を保存し、推論時に OpenVINO Core と
+Hugging Face tokenizer を組み合わせた fallback generator を使います。
+
+## 出力されるメトリクス
+
+各生成後、stderr に次の形式でメトリクスを表示します。
+
+```text
+metrics: FTTT=0.123s, tokens=128, total=4.567s, tokens/sec=28.02
+```
+
+- `FTTT`: first token time
+- `tokens`: 生成トークン数
+- `total`: 生成全体の経過時間
+- `tokens/sec`: 1 秒あたりの生成トークン数
