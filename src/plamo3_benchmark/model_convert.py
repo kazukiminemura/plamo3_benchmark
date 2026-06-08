@@ -53,7 +53,7 @@ def _patch_gqa_scaled_dot_product_attention(torch: Any) -> Any:
         torch.nn.functional.scaled_dot_product_attention = original_sdpa
 
 
-def _write_json_if_present(model: str, output_dir: Path, filename: str) -> None:
+def _write_json_if_present(model: str, output_dir: Path, filename: str, *, local_files_only: bool) -> None:
     if is_local_model_path(model):
         source = Path(model) / filename
         if source.exists():
@@ -66,16 +66,16 @@ def _write_json_if_present(model: str, output_dir: Path, filename: str) -> None:
         return
 
     try:
-        source_path = Path(hf_hub_download(repo_id=model, filename=filename))
+        source_path = Path(hf_hub_download(repo_id=model, filename=filename, local_files_only=local_files_only))
     except Exception:
         return
     (output_dir / filename).write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
 
 
-def _save_tokenizer_and_configs(tokenizer: Any, model: str, output_dir: Path) -> None:
+def _save_tokenizer_and_configs(tokenizer: Any, model: str, output_dir: Path, *, local_files_only: bool) -> None:
     tokenizer.save_pretrained(output_dir)
-    _write_json_if_present(model, output_dir, "config.json")
-    _write_json_if_present(model, output_dir, "generation_config.json")
+    _write_json_if_present(model, output_dir, "config.json", local_files_only=local_files_only)
+    _write_json_if_present(model, output_dir, "generation_config.json", local_files_only=local_files_only)
     if not (output_dir / "generation_config.json").exists():
         (output_dir / "generation_config.json").write_text(
             json.dumps({"max_new_tokens": 128}, indent=2),
@@ -121,19 +121,76 @@ def _try_save_openvino_tokenizer(tokenizer: Any, ov: Any, openvino_tokenizers: A
         return "huggingface"
 
 
-def _apply_weight_compression(ov_model: Any, weight_format: str) -> Any:
+def _die_hf_load_error(model: str, exc: Exception) -> None:
+    die(
+        f"Failed to load Hugging Face model files for {model!r}. "
+        "If this is a transient HEAD/download failure, retry the command. "
+        "If the files are already cached, add `--local-files-only`; otherwise check your "
+        "network connection and Hugging Face authentication. "
+        f"Original error: {exc}"
+    )
+
+
+def _load_tokenizer(AutoTokenizer: Any, args: Any) -> Any:
+    try:
+        return AutoTokenizer.from_pretrained(
+            args.model,
+            trust_remote_code=args.trust_remote_code,
+            local_files_only=args.local_files_only,
+        )
+    except Exception as exc:
+        _die_hf_load_error(args.model, exc)
+
+
+def _compression_mode_name(weight_format: str, *, npu_target: bool) -> str | None:
+    if weight_format == "int8":
+        return "INT8_SYM" if npu_target else "INT8_ASYM"
+    if weight_format == "int4":
+        return "INT4_SYM" if npu_target else "INT4_ASYM"
+    return None
+
+
+def _apply_weight_compression(ov_model: Any, weight_format: str, *, npu_target: bool) -> Any:
     if weight_format not in {"int8", "int4"}:
         return ov_model
 
     compress_weights, CompressWeightsMode, GroupSizeFallbackMode, AdvancedCompressionParameters = _import_nncf()
-    if weight_format == "int8":
+    if weight_format == "int8" and npu_target:
+        mode = CompressWeightsMode.INT8_SYM
+        advanced_parameters = None
+        kwargs: dict[str, Any] = {}
+    elif weight_format == "int8":
         mode = CompressWeightsMode.INT8_ASYM
         advanced_parameters = None
+        kwargs = {}
+    elif npu_target:
+        mode = CompressWeightsMode.INT4_SYM
+        advanced_parameters = AdvancedCompressionParameters(group_size_fallback_mode=GroupSizeFallbackMode.ADJUST)
+        kwargs = {"ratio": 1.0, "group_size": -1}
     else:
         mode = CompressWeightsMode.INT4_ASYM
         advanced_parameters = AdvancedCompressionParameters(group_size_fallback_mode=GroupSizeFallbackMode.ADJUST)
+        kwargs = {}
     print(f"Compressing OpenVINO model weights to {mode} with NNCF...", file=sys.stderr)
-    return compress_weights(ov_model, mode=mode, advanced_parameters=advanced_parameters)
+    return compress_weights(ov_model, mode=mode, advanced_parameters=advanced_parameters, **kwargs)
+
+
+def _device_targets_npu(device: str | None) -> bool:
+    if not device:
+        return False
+    parts = device.upper().replace(":", ",").split(",")
+    return any(part == "NPU" or part.startswith("NPU.") for part in parts)
+
+
+def _conversion_weight_format(args: Any) -> str:
+    if _device_targets_npu(getattr(args, "target_device", None)) and args.weight_format == "fp32":
+        print(
+            "warning: NPU target requested with --weight-format fp32; saving FP16 weights because "
+            "NPU execution is optimized for FP16/quantized IR.",
+            file=sys.stderr,
+        )
+        return "fp16"
+    return args.weight_format
 
 
 def _save_openvino_model(ov: Any, ov_model: Any, xml_path: Path, *, compress_to_fp16: bool) -> None:
@@ -155,14 +212,21 @@ def _save_openvino_model(ov: Any, ov_model: Any, xml_path: Path, *, compress_to_
 def convert(args: Any) -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    check_hugging_face_access(args.model)
+    check_hugging_face_access(args.model, local_files_only=args.local_files_only)
 
     if args.weight_format not in {"fp32", "fp16", "int8", "int4"}:
         die("This OpenVINO GenAI conversion path supports --weight-format fp32, fp16, int8, or int4.")
+    if _device_targets_npu(getattr(args, "target_device", None)) and args.max_seq_len is None:
+        args.max_seq_len = 512
+        print(
+            "NPU target requested; using --max-seq-len 512 to export a static-shape graph. "
+            "Pass --max-seq-len to choose a different fixed context length.",
+            file=sys.stderr,
+        )
 
     AutoTokenizer, _, _ = import_transformers()
     ov, openvino_tokenizers = _import_openvino_converter()
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
+    tokenizer = _load_tokenizer(AutoTokenizer, args)
 
     existing_model = output_dir / "openvino_model.xml"
     if existing_model.exists() and not args.force:
@@ -181,15 +245,30 @@ def _update_existing_model_dir(
 ) -> int:
     print(f"Reusing existing OpenVINO model: {existing_model}", file=sys.stderr)
     existing_info = _read_conversion_info(output_dir)
-    if args.weight_format in {"int8", "int4"} and existing_info.get("weight_format") != args.weight_format:
+    weight_format = _conversion_weight_format(args)
+    npu_target = _device_targets_npu(getattr(args, "target_device", None))
+    if _device_targets_npu(getattr(args, "target_device", None)) and (
+        existing_info.get("static_shapes") is not True or existing_info.get("input_dtype") != "int32"
+    ):
         die(
-            f"openvino_model.xml already exists and is not marked as {args.weight_format.upper()}. "
+            "openvino_model.xml already exists but is not marked as NPU-friendly static-shape/int32 IR. "
+            "Re-run with `--force` to rebuild it for NPU, or use a new --output-dir."
+        )
+    if weight_format in {"int8", "int4"} and existing_info.get("weight_format") != weight_format:
+        die(
+            f"openvino_model.xml already exists and is not marked as {weight_format.upper()}. "
             "On Windows, in-place compression can leave the existing .bin locked. "
-            f"Re-run with `--force` to rebuild and save {args.weight_format.upper()}, or use a new "
-            f"--output-dir such as `ov-plamo3-{args.weight_format}`."
+            f"Re-run with `--force` to rebuild and save {weight_format.upper()}, or use a new "
+            f"--output-dir such as `ov-plamo3-{weight_format}`."
+        )
+    compression_mode = _compression_mode_name(weight_format, npu_target=npu_target)
+    if npu_target and compression_mode and existing_info.get("compression_mode") != compression_mode:
+        die(
+            f"openvino_model.xml already exists but is not marked as NPU-friendly {compression_mode}. "
+            f"Re-run with `--force` to rebuild it for NPU {weight_format}, or use a new --output-dir."
         )
 
-    _save_tokenizer_and_configs(tokenizer, args.model, output_dir)
+    _save_tokenizer_and_configs(tokenizer, args.model, output_dir, local_files_only=args.local_files_only)
     tokenizer_backend = _try_save_openvino_tokenizer(tokenizer, ov, openvino_tokenizers, output_dir)
     try:
         ov_model = ov.Core().read_model(existing_model)
@@ -204,9 +283,13 @@ def _update_existing_model_dir(
         output_dir,
         {
             "model": args.model,
-            "weight_format": args.weight_format,
+            "weight_format": weight_format,
+            "target_device": args.target_device,
+            "compression_mode": compression_mode,
             "tokenizer_backend": tokenizer_backend,
             "trace_sequence_length": trace_sequence_length,
+            "static_shapes": npu_target,
+            "input_dtype": "int32" if npu_target else existing_info.get("input_dtype", "int64"),
             "uses_kv_cache": False,
             "generator": "openvino_genai" if tokenizer_backend == "openvino" else "openvino_core_hf_tokenizer",
         },
@@ -238,20 +321,27 @@ def _convert_model_from_transformers(
         def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, beam_idx: torch.Tensor) -> torch.Tensor:
             del beam_idx
             return self.wrapped_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+                input_ids=input_ids.to(torch.long),
+                attention_mask=attention_mask.to(torch.long),
                 use_cache=False,
                 return_dict=False,
             )[0]
 
-    dtype = torch.float16 if args.weight_format in {"fp16", "int8", "int4"} else torch.float32
+    weight_format = _conversion_weight_format(args)
+    npu_target = _device_targets_npu(getattr(args, "target_device", None))
+    token_dtype = torch.int32 if npu_target else torch.long
+    dtype = torch.float16 if weight_format in {"fp16", "int8", "int4"} else torch.float32
     print("Loading Hugging Face model with trust_remote_code=True...", file=sys.stderr)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        trust_remote_code=args.trust_remote_code,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            trust_remote_code=args.trust_remote_code,
+            dtype=dtype,
+            low_cpu_mem_usage=True,
+            local_files_only=args.local_files_only,
+        )
+    except Exception as exc:
+        _die_hf_load_error(args.model, exc)
     model.eval()
     model.config.use_cache = False
     wrapped_model = CausalLMLogitsWrapper(model).eval()
@@ -261,12 +351,15 @@ def _convert_model_from_transformers(
         if pad_id is None:
             pad_id = 0
         example_inputs = {
-            "input_ids": torch.full((1, args.max_seq_len), pad_id, dtype=torch.long),
-            "attention_mask": torch.ones((1, args.max_seq_len), dtype=torch.long),
+            "input_ids": torch.full((1, args.max_seq_len), pad_id, dtype=token_dtype),
+            "attention_mask": torch.ones((1, args.max_seq_len), dtype=token_dtype),
         }
     else:
         prompt = args.example_prompt or "こんにちは"
         example_inputs = tokenizer(prompt, return_tensors="pt")
+        if npu_target:
+            example_inputs["input_ids"] = example_inputs["input_ids"].to(torch.int32)
+            example_inputs["attention_mask"] = example_inputs["attention_mask"].to(torch.int32)
     example_beam_idx = torch.arange(example_inputs["input_ids"].shape[0], dtype=torch.int32)
 
     print("Converting PyTorch model with openvino.convert_model...", file=sys.stderr)
@@ -277,20 +370,30 @@ def _convert_model_from_transformers(
                 example_input=(example_inputs["input_ids"], example_inputs["attention_mask"], example_beam_idx),
                 dynamo=True,
             )
-        try:
+        if npu_target:
+            trace_len = int(example_inputs["input_ids"].shape[1])
             ov_model.reshape(
                 {
-                    "input_ids": ov.PartialShape([-1, -1]),
-                    "attention_mask": ov.PartialShape([-1, -1]),
-                    "beam_idx": ov.PartialShape([-1]),
+                    "input_ids": ov.PartialShape([1, trace_len]),
+                    "attention_mask": ov.PartialShape([1, trace_len]),
+                    "beam_idx": ov.PartialShape([1]),
                 }
             )
-        except Exception:
-            print(
-                "warning: converted model kept the traced prompt shape; use --example-prompt "
-                "with a representative prompt length if generation rejects other lengths.",
-                file=sys.stderr,
-            )
+        else:
+            try:
+                ov_model.reshape(
+                    {
+                        "input_ids": ov.PartialShape([-1, -1]),
+                        "attention_mask": ov.PartialShape([-1, -1]),
+                        "beam_idx": ov.PartialShape([-1]),
+                    }
+                )
+            except Exception:
+                print(
+                    "warning: converted model kept the traced prompt shape; use --example-prompt "
+                    "with a representative prompt length if generation rejects other lengths.",
+                    file=sys.stderr,
+                )
     except Exception as exc:
         die(
             "OpenVINO conversion failed for the PLaMo 3 custom PyTorch model. "
@@ -298,23 +401,28 @@ def _convert_model_from_transformers(
             f"OpenVINO GenAI model adapter/exporter. Original error: {exc}"
         )
 
-    ov_model = _apply_weight_compression(ov_model, args.weight_format)
+    compression_mode = _compression_mode_name(weight_format, npu_target=npu_target)
+    ov_model = _apply_weight_compression(ov_model, weight_format, npu_target=npu_target)
     _save_openvino_model(
         ov,
         ov_model,
         output_dir / "openvino_model.xml",
-        compress_to_fp16=args.weight_format == "fp16",
+        compress_to_fp16=weight_format == "fp16",
     )
-    _save_tokenizer_and_configs(tokenizer, args.model, output_dir)
+    _save_tokenizer_and_configs(tokenizer, args.model, output_dir, local_files_only=args.local_files_only)
 
     tokenizer_backend = _try_save_openvino_tokenizer(tokenizer, ov, openvino_tokenizers, output_dir)
     _write_conversion_info(
         output_dir,
         {
             "model": args.model,
-            "weight_format": args.weight_format,
+            "weight_format": weight_format,
+            "target_device": args.target_device,
+            "compression_mode": compression_mode,
             "tokenizer_backend": tokenizer_backend,
             "trace_sequence_length": int(example_inputs["input_ids"].shape[1]),
+            "static_shapes": npu_target,
+            "input_dtype": "int32" if npu_target else "int64",
             "uses_kv_cache": False,
             "generator": "openvino_genai" if tokenizer_backend == "openvino" else "openvino_core_hf_tokenizer",
         },

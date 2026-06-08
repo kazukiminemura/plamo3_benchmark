@@ -73,9 +73,32 @@ def _print_generation_metrics(token_count: int, start_time: float, first_token_t
     )
 
 
+def _resolve_fallback_max_new_tokens(prompt_len: int, requested_max_new_tokens: int, trace_len: int) -> int:
+    available_new_tokens = trace_len - prompt_len
+    if available_new_tokens <= 0:
+        die(
+            f"Prompt length ({prompt_len}) reaches the traced sequence length ({trace_len}). "
+            "Use /reset to clear chat history, shorten the prompt, or re-run convert with a larger "
+            f"`--max-seq-len`, for example `--max-seq-len {max(trace_len * 2, prompt_len + 128)}`."
+        )
+
+    if requested_max_new_tokens > available_new_tokens:
+        print(
+            f"warning: max_new_tokens ({requested_max_new_tokens}) exceeds the remaining traced "
+            f"sequence length ({available_new_tokens}); generating at most {available_new_tokens} "
+            "new tokens. Re-run convert with a larger "
+            f"`--max-seq-len`, for example `--max-seq-len {prompt_len + requested_max_new_tokens}`.",
+            file=sys.stderr,
+        )
+        return available_new_tokens
+
+    return requested_max_new_tokens
+
+
 class OpenVINOCoreGenerator:
     def __init__(self, args: Any) -> None:
         import openvino as ov
+        import numpy as np
 
         AutoTokenizer, _, _ = import_transformers()
 
@@ -86,6 +109,10 @@ class OpenVINOCoreGenerator:
         ov_model = core.read_model(self.model_dir / "openvino_model.xml")
         self.model_output = ov_model.output(0)
         self.input_names = {item.get_any_name(): item for item in ov_model.inputs}
+        self.input_dtypes = {
+            name: self._numpy_dtype_for_ov_type(input_node.get_element_type(), np)
+            for name, input_node in self.input_names.items()
+        }
 
         result_shape = list(self.model_output.get_partial_shape())
         self.trace_len = (
@@ -96,28 +123,33 @@ class OpenVINOCoreGenerator:
         self.compiled = core.compile_model(ov_model, args.device)
         self.compiled_output = self.compiled.output(0)
 
+    @staticmethod
+    def _numpy_dtype_for_ov_type(ov_type: Any, np: Any) -> Any:
+        type_name = str(ov_type)
+        if type_name in {"i32", "<Type: 'int32_t'>"}:
+            return np.int32
+        if type_name in {"i64", "<Type: 'int64_t'>"}:
+            return np.int64
+        return np.int64
+
     def generate(self, prompt: str, *, print_output: bool) -> str:
         import numpy as np
 
         encoded = self.tokenizer(prompt, return_tensors="np")
-        input_ids = encoded["input_ids"].astype(np.int64)
+        input_dtype = self.input_dtypes.get("input_ids", np.int64)
+        mask_dtype = self.input_dtypes.get("attention_mask", input_dtype)
+        input_ids = encoded["input_ids"].astype(input_dtype)
         prompt_len = int(input_ids.shape[1])
-        attention_mask = encoded["attention_mask"].astype(np.int64)
+        attention_mask = encoded["attention_mask"].astype(mask_dtype)
         trace_len = self.trace_len or prompt_len
-
-        if prompt_len + self.args.max_new_tokens > trace_len:
-            die(
-                f"Prompt length ({prompt_len}) + max_new_tokens ({self.args.max_new_tokens}) exceeds "
-                f"the traced sequence length ({trace_len}). Re-run convert with a larger "
-                "`--max-seq-len`, for example `--max-seq-len 512`."
-            )
+        max_new_tokens = _resolve_fallback_max_new_tokens(prompt_len, self.args.max_new_tokens, trace_len)
 
         tokens = np.full(
             (1, trace_len),
             self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0,
-            dtype=np.int64,
+            dtype=input_dtype,
         )
-        mask = np.zeros((1, trace_len), dtype=np.int64)
+        mask = np.zeros((1, trace_len), dtype=mask_dtype)
         tokens[:, :prompt_len] = input_ids
         mask[:, :prompt_len] = attention_mask
 
@@ -129,7 +161,7 @@ class OpenVINOCoreGenerator:
         if print_output and not self.args.skip_prompt:
             print(prompt, end="" if self.args.stream else "\n")
 
-        for position in range(prompt_len, min(trace_len, prompt_len + self.args.max_new_tokens)):
+        for position in range(prompt_len, prompt_len + max_new_tokens):
             inputs = {"input_ids": tokens, "attention_mask": mask}
             if "beam_idx" in self.input_names:
                 inputs["beam_idx"] = np.array([0], dtype=np.int32)

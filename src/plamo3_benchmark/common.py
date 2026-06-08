@@ -43,7 +43,7 @@ def looks_like_openvino_dir(path: str) -> bool:
     return any(model_path.glob("*.xml")) and (model_path / "config.json").exists()
 
 
-def check_hugging_face_access(model: str) -> None:
+def check_hugging_face_access(model: str, *, local_files_only: bool = False) -> None:
     if is_local_model_path(model):
         return
 
@@ -54,7 +54,7 @@ def check_hugging_face_access(model: str) -> None:
         return
 
     try:
-        hf_hub_download(repo_id=model, filename="config.json")
+        hf_hub_download(repo_id=model, filename="config.json", local_files_only=local_files_only)
     except GatedRepoError:
         die(
             f"Cannot access gated Hugging Face model {model!r}.\n"
@@ -65,6 +65,14 @@ def check_hugging_face_access(model: str) -> None:
         )
     except RepositoryNotFoundError:
         die(f"Hugging Face model {model!r} was not found, or your account cannot see it.")
+    except Exception as exc:
+        if local_files_only:
+            die(
+                f"Hugging Face model {model!r} was not found in the local cache. "
+                "Run once without `--local-files-only`, or pass a local model directory. "
+                f"Original error: {exc}"
+            )
+        raise
 
 
 def sampling_kwargs(args: Any) -> dict[str, Any]:

@@ -44,7 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["fp32", "fp16", "int8", "int4"],
         help=(
             "OpenVINO save precision. int8 applies NNCF INT8_ASYM weight compression; "
-            "int4 applies NNCF INT4_ASYM weight compression."
+            "int4 applies NNCF INT4_ASYM weight compression. With --target-device NPU, "
+            "int8/int4 use symmetric compression."
         ),
     )
     convert_parser.add_argument("--example-prompt", help="Prompt used to trace the PyTorch model.")
@@ -54,9 +55,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Trace with this fixed sequence length. Needed for the HF-tokenizer fallback generator.",
     )
     convert_parser.add_argument(
+        "--target-device",
+        default="CPU",
+        help=(
+            "Device to optimize the exported IR for. Use NPU to keep static shapes and int32 "
+            "token inputs. Default: CPU."
+        ),
+    )
+    convert_parser.add_argument(
         "--force",
         action="store_true",
         help="Reconvert the OpenVINO model even if openvino_model.xml already exists.",
+    )
+    convert_parser.add_argument(
+        "--local-files-only",
+        action="store_true",
+        help="Use only files already present in the local Hugging Face cache or a local model directory.",
     )
     convert_parser.add_argument(
         "--trust-remote-code",
