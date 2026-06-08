@@ -20,7 +20,6 @@ def _add_generation_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=50)
-    parser.add_argument("--repetition-penalty", type=float, default=1.0)
     parser.add_argument("--stream", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--skip-prompt", action=argparse.BooleanOptionalAction, default=True)
 
@@ -48,11 +47,10 @@ def build_parser() -> argparse.ArgumentParser:
             "int8/int4 use symmetric compression."
         ),
     )
-    convert_parser.add_argument("--example-prompt", help="Prompt used to trace the PyTorch model.")
     convert_parser.add_argument(
         "--max-seq-len",
         type=int,
-        help="Trace with this fixed sequence length. Needed for the HF-tokenizer fallback generator.",
+        help="Trace with this fixed sequence length.",
     )
     convert_parser.add_argument(
         "--target-device",
@@ -88,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate_parser.add_argument(
         "--model",
         default="ov-plamo3",
-        help="Path to an OpenVINO GenAI model directory.",
+        help="Path to an OpenVINO model directory.",
     )
     generate_parser.add_argument("--prompt-file")
     generate_parser.add_argument("--stdin", action="store_true")
@@ -102,7 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument(
         "--model",
         default="ov-plamo3",
-        help="Path to an OpenVINO GenAI model directory.",
+        help="Path to an OpenVINO model directory.",
     )
     chat_parser.add_argument("--system", help="Optional system prompt prepended to the chat history.")
     chat_parser.add_argument("--max-turns", type=int, help="Exit after this many user turns.")

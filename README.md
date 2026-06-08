@@ -1,6 +1,6 @@
 # plamo3_benchmark
 
-`pfnet/plamo-3-nict-8b-base` を OpenVINO / OpenVINO GenAI で動かすための
+`pfnet/plamo-3-nict-8b-base` を OpenVINO で動かすための
 Python CLI です。Hugging Face 上の PLaMo 3 NICT 8B Base を OpenVINO IR に変換し、
 テキスト生成や簡易チャットを実行できます。
 
@@ -45,24 +45,18 @@ flowchart TD
     ModelConvert --> OVConvert["openvino.convert_model"]
     ModelConvert --> GQAPatch["GQA SDPA patch<br/>K/V head expansion"]
     ModelConvert --> NNCF["NNCF weight compression<br/>fp16 / int8 / int4"]
-    ModelConvert --> OVTokenizer["openvino-tokenizers<br/>if supported"]
     ModelConvert --> Artifact["OpenVINO model directory<br/>openvino_model.xml/bin<br/>tokenizer/config files"]
 
     HFModel --> OVConvert
     GQAPatch --> OVConvert
     OVConvert --> NNCF
     NNCF --> Artifact
-    HFTokenizer --> OVTokenizer
     HFTokenizer --> Artifact
-    OVTokenizer --> Artifact
 
     GenerateCmd --> Inference["inference.py"]
     ChatCmd --> Inference
-    Inference --> Loader{"KV-cache GenAI graph<br/>and openvino_tokenizer.xml?"}
-    Loader -->|"yes"| GenAI["OpenVINO GenAI<br/>LLMPipeline"]
-    Loader -->|"no"| CoreFallback["OpenVINO Core fallback<br/>HF tokenizer"]
-    Artifact --> Loader
-    GenAI --> Metrics["Output + metrics<br/>FTTT / tokens/sec"]
+    Inference --> CoreFallback["OpenVINO Core<br/>HF tokenizer"]
+    Artifact --> CoreFallback
     CoreFallback --> Metrics
     Metrics --> User
 ```
@@ -115,9 +109,9 @@ uv run plamo3-ov chat --model ov-plamo3 --device CPU --max-new-tokens 128
 
 ## OpenVINO 形式への変換
 
-この CLI は `optimum-cli` を使わず、`openvino.convert_model` と
-`openvino-tokenizers` で OpenVINO 用のモデルディレクトリを作ります。
-`openvino-genai` は変換済みモデルの推論に使います。
+この CLI は `optimum-cli` を使わず、`openvino.convert_model` で
+OpenVINO 用のモデルディレクトリを作ります。推論は OpenVINO Core と
+Hugging Face tokenizer を組み合わせて実行します。
 
 ```powershell
 uv run plamo3-ov convert --output-dir ov-plamo3 --weight-format fp16
@@ -130,7 +124,6 @@ uv run plamo3-ov convert --output-dir ov-plamo3 --weight-format fp16
 - `--weight-format`: `fp32`、`fp16`、`int8`、`int4`
 - `--max-seq-len`: 変換時に使う固定シーケンス長
 - `--target-device`: 変換先デバイスの目安。`NPU` を指定すると固定 shape と int32 入力で変換
-- `--example-prompt`: tracing に使うプロンプト
 - `--force`: 既存の `openvino_model.xml` があっても再変換
 - `--local-files-only`: Hugging Face にアクセスせず、ローカル cache またはローカルモデルディレクトリだけを使う
 - `--trust-remote-code` / `--no-trust-remote-code`: custom code の許可
@@ -200,7 +193,6 @@ Get-Content prompt.txt | uv run plamo3-ov generate --stdin --model ov-plamo3
 - `--temperature 0.8`
 - `--top-p 0.95`
 - `--top-k 50`
-- `--repetition-penalty 1.0`
 - `--stream` / `--no-stream`
 - `--skip-prompt` / `--no-skip-prompt`
 
@@ -231,23 +223,14 @@ uv run plamo3-ov chat --model ov-plamo3 --system "日本語で簡潔に答えて
 PLaMo 3 は Hugging Face の custom code モデルです。このリポジトリの変換ルートは
 実験的です。
 
-OpenVINO GenAI の Python API は、変換済み OpenVINO IR の推論パイプラインを提供します。
-Hugging Face の custom architecture を直接 OpenVINO GenAI だけで IR へ変換する API は
-現時点の `openvino-genai` パッケージにはありません。そのため、この CLI は
-`optimum-cli` を使わず、OpenVINO 本体の `openvino.convert_model` で PLaMo 3 を変換します。
+この CLI は `optimum-cli` を使わず、OpenVINO 本体の `openvino.convert_model` で
+PLaMo 3 を変換します。
 
 PLaMo 3 の GQA attention は、変換時だけ K/V heads を明示的に展開して OpenVINO の
 `ScaledDotProductAttention` に渡します。
 
-PLaMo 3 tokenizer は custom Python tokenizer ですが、この CLI は `tokenizer.jsonl` から
-互換 Fast Unigram tokenizer を組み立て、`openvino-tokenizers` へ渡します。通常は
-`openvino_tokenizer.xml` / `openvino_detokenizer.xml` が保存されます。
-
-ただし、現在の PLaMo 3 モデル本体の変換は KV-cache なしの実験的 IR です。そのため、
-tokenizer を OpenVINO 形式に保存できても、推論時は OpenVINO Core と Hugging Face tokenizer を
-組み合わせた fallback generator を使います。
-
-fallback generator では、`--max-seq-len` で変換した固定長の範囲内で生成します。
+推論では OpenVINO Core と Hugging Face tokenizer を組み合わせます。`--max-seq-len`
+で変換した固定長の範囲内で生成します。
 `prompt length + --max-new-tokens` が固定長を超える場合、生成可能な最大トークン数へ
 自動調整し、stderr に警告を表示します。長い応答が必要な場合は、たとえば次のように
 大きめの `--max-seq-len` で再変換してください。

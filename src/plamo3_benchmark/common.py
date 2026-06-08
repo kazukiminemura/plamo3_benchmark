@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any
 
 
 DEFAULT_MODEL_ID = "pfnet/plamo-3-nict-8b-base"
@@ -23,13 +22,13 @@ def die(message: str, exit_code: int = 1) -> None:
     raise SystemExit(exit_code)
 
 
-def import_transformers() -> tuple[Any, Any, Any]:
+def import_auto_tokenizer():
     try:
-        from transformers import AutoTokenizer, TextStreamer, set_seed
+        from transformers import AutoTokenizer
     except ImportError as exc:
         die("transformers is not installed. Run `uv sync` first.")
         raise exc
-    return AutoTokenizer, TextStreamer, set_seed
+    return AutoTokenizer
 
 
 def is_local_model_path(model: str) -> bool:
@@ -38,9 +37,7 @@ def is_local_model_path(model: str) -> bool:
 
 def looks_like_openvino_dir(path: str) -> bool:
     model_path = Path(path)
-    if not model_path.is_dir():
-        return False
-    return any(model_path.glob("*.xml")) and (model_path / "config.json").exists()
+    return model_path.is_dir() and (model_path / "openvino_model.xml").exists() and (model_path / "config.json").exists()
 
 
 def check_hugging_face_access(model: str, *, local_files_only: bool = False) -> None:
@@ -73,17 +70,3 @@ def check_hugging_face_access(model: str, *, local_files_only: bool = False) -> 
                 f"Original error: {exc}"
             )
         raise
-
-
-def sampling_kwargs(args: Any) -> dict[str, Any]:
-    do_sample = args.temperature > 0
-    kwargs: dict[str, Any] = {
-        "max_new_tokens": args.max_new_tokens,
-        "do_sample": do_sample,
-        "repetition_penalty": args.repetition_penalty,
-    }
-    if do_sample:
-        kwargs["temperature"] = args.temperature
-        kwargs["top_p"] = args.top_p
-        kwargs["top_k"] = args.top_k
-    return kwargs

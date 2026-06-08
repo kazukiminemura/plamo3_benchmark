@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import json
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
-from .common import die, import_transformers, looks_like_openvino_dir, sampling_kwargs
+from .common import die, import_auto_tokenizer, looks_like_openvino_dir
 
 
 def read_prompt(args: Any) -> str:
@@ -25,21 +24,10 @@ def read_prompt(args: Any) -> str:
     return ""
 
 
-def _import_openvino_genai() -> Any:
-    try:
-        import openvino_genai as ov_genai
-    except ImportError as exc:
-        die("openvino-genai is not installed. Run `uv sync` first.")
-        raise exc
-    return ov_genai
-
-
 def _sample_next_token(logits: Any, args: Any) -> int:
     import numpy as np
 
     logits = logits.astype("float64")
-    if args.repetition_penalty != 1.0:
-        pass
     if args.temperature <= 0:
         return int(np.argmax(logits))
 
@@ -96,16 +84,14 @@ def _resolve_fallback_max_new_tokens(prompt_len: int, requested_max_new_tokens: 
     return requested_max_new_tokens
 
 
-class OpenVINOCoreGenerator:
+class OpenVINOGenerator:
     def __init__(self, args: Any) -> None:
         import openvino as ov
         import numpy as np
 
-        AutoTokenizer, _, _ = import_transformers()
-
         self.args = args
         self.model_dir = Path(args.model)
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir, trust_remote_code=True)
+        self.tokenizer = import_auto_tokenizer().from_pretrained(self.model_dir, trust_remote_code=True, use_fast=False)
         core = ov.Core()
         ov_model = core.read_model(self.model_dir / "openvino_model.xml")
         self.model_output = ov_model.output(0)
@@ -187,69 +173,11 @@ class OpenVINOCoreGenerator:
         return text
 
 
-class OpenVINOGenAIGenerator:
-    def __init__(self, args: Any) -> None:
-        self.args = args
-        ov_genai = _import_openvino_genai()
-        try:
-            print(f"Using OpenVINO GenAI inference device: {args.device}", file=sys.stderr)
-            self.pipe = ov_genai.LLMPipeline(args.model, args.device)
-        except RuntimeError as exc:
-            die(f"OpenVINO GenAI could not load the model directory: {exc}")
-
-    def generate(self, prompt: str, *, print_output: bool) -> str:
-        generation_kwargs = sampling_kwargs(self.args)
-        generation_kwargs["echo"] = not self.args.skip_prompt
-        start_time = time.perf_counter()
-        first_token_time: float | None = None
-        chunks: list[str] = []
-
-        def streamer(token: str) -> bool:
-            nonlocal first_token_time
-            if first_token_time is None:
-                first_token_time = time.perf_counter()
-            if print_output and self.args.stream:
-                print(token, end="", flush=True)
-            chunks.append(token)
-            return False
-
-        try:
-            self.pipe.generate(prompt, streamer=streamer, **generation_kwargs)
-        except RuntimeError as exc:
-            die(
-                "OpenVINO GenAI generation failed. If this model was produced by "
-                "`plamo3-ov convert`, it may not have the stateful KV-cache LLM graph "
-                f"that LLMPipeline expects. Original error: {exc}"
-            )
-        text = "".join(chunks)
-        if print_output and self.args.stream:
-            print()
-        elif print_output:
-            print(text)
-        _print_generation_metrics(len(chunks), start_time, first_token_time)
-        return text
-
-
 def load_generator(args: Any) -> Any:
     model_source = args.model
     if not looks_like_openvino_dir(model_source):
         die(f"{model_source!r} does not look like an exported OpenVINO model. Run `plamo3-ov convert --output-dir ov-plamo3` first.")
-
-    model_path = Path(model_source)
-    conversion_info_path = model_path / "plamo3_ov_conversion.json"
-    try:
-        conversion_info = (
-            json.loads(conversion_info_path.read_text(encoding="utf-8")) if conversion_info_path.exists() else {}
-        )
-    except Exception:
-        conversion_info = {}
-    if conversion_info.get("uses_kv_cache") is False:
-        return OpenVINOCoreGenerator(args)
-
-    has_openvino_tokenizer = (model_path / "openvino_tokenizer.xml").exists()
-    if not has_openvino_tokenizer:
-        return OpenVINOCoreGenerator(args)
-    return OpenVINOGenAIGenerator(args)
+    return OpenVINOGenerator(args)
 
 
 def generate(args: Any) -> int:
