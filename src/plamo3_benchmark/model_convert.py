@@ -113,12 +113,89 @@ def _try_save_openvino_tokenizer(tokenizer: Any, ov: Any, openvino_tokenizers: A
         ov.save_model(detokenizer_model, output_dir / "openvino_detokenizer.xml")
         return "openvino"
     except Exception as exc:
+        if tokenizer.__class__.__name__ == "Plamo3Tokenizer":
+            fast_tokenizer = _build_plamo3_fast_tokenizer(tokenizer)
+            if fast_tokenizer is not None:
+                try:
+                    tokenizer_model, detokenizer_model = openvino_tokenizers.convert_tokenizer(
+                        fast_tokenizer,
+                        with_detokenizer=True,
+                        skip_special_tokens=True,
+                        streaming_detokenizer=True,
+                    )
+                    ov.save_model(tokenizer_model, output_dir / "openvino_tokenizer.xml")
+                    ov.save_model(detokenizer_model, output_dir / "openvino_detokenizer.xml")
+                    fast_tokenizer.save_pretrained(output_dir)
+                    print(
+                        "Converted PLaMo 3 tokenizer through a compatible Fast Unigram tokenizer.",
+                        file=sys.stderr,
+                    )
+                    return "openvino"
+                except Exception as fast_exc:
+                    print(
+                        "warning: PLaMo 3 Fast tokenizer compatibility path failed; saved Hugging Face tokenizer "
+                        f"and will use the OpenVINO Core fallback generator. Original errors: {exc}; {fast_exc}",
+                        file=sys.stderr,
+                    )
+                    return "huggingface"
         print(
             "warning: OpenVINO tokenizer conversion failed; saved Hugging Face tokenizer "
             f"and will use the OpenVINO Core fallback generator. Original error: {exc}",
             file=sys.stderr,
         )
         return "huggingface"
+
+
+def _build_plamo3_fast_tokenizer(tokenizer: Any) -> Any | None:
+    try:
+        from tokenizers import Regex, Tokenizer
+        from tokenizers import models, pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+    except ImportError:
+        return None
+
+    data = getattr(tokenizer, "data", None)
+    if not data:
+        return None
+
+    vocab = [(str(row[0]), float(row[1])) for row in data]
+    backend = Tokenizer(models.Unigram(vocab, unk_id=tokenizer.unk_token_id or 0, byte_fallback=True))
+
+    splitters: list[Any] = [
+        pre_tokenizers.Split(
+            Regex(r"(<\|plamo:[^|\s]{,64}\|>)"),
+            behavior="isolated",
+            invert=False,
+        )
+    ]
+    boundary_patterns: list[str] = []
+    repeated_threshold = getattr(tokenizer, "break_around_repeated_chars_threshold", None)
+    spaces_threshold = getattr(tokenizer, "break_around_consecutive_spaces_threshold", None)
+    if repeated_threshold is not None:
+        boundary_patterns.append(f"(.)\\2{{{int(repeated_threshold) - 1},}}")
+    if spaces_threshold is not None:
+        boundary_patterns.append(f" {{{int(spaces_threshold)},}}")
+    if boundary_patterns:
+        splitters.append(
+            pre_tokenizers.Split(
+                Regex(f"({'|'.join(boundary_patterns)})"),
+                behavior="isolated",
+                invert=False,
+            )
+        )
+    backend.pre_tokenizer = pre_tokenizers.Sequence(splitters)
+
+    fast_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token=tokenizer.unk_token,
+        bos_token=tokenizer.bos_token,
+        eos_token=tokenizer.eos_token,
+        pad_token=tokenizer.pad_token,
+        clean_up_tokenization_spaces=tokenizer.clean_up_tokenization_spaces,
+    )
+    fast_tokenizer.add_bos_token = tokenizer.add_bos_token
+    fast_tokenizer.add_eos_token = tokenizer.add_eos_token
+    return fast_tokenizer
 
 
 def _die_hf_load_error(model: str, exc: Exception) -> None:
@@ -268,8 +345,6 @@ def _update_existing_model_dir(
             f"Re-run with `--force` to rebuild it for NPU {weight_format}, or use a new --output-dir."
         )
 
-    _save_tokenizer_and_configs(tokenizer, args.model, output_dir, local_files_only=args.local_files_only)
-    tokenizer_backend = _try_save_openvino_tokenizer(tokenizer, ov, openvino_tokenizers, output_dir)
     try:
         ov_model = ov.Core().read_model(existing_model)
         output_shape = ov_model.outputs[0].get_partial_shape()
@@ -278,6 +353,18 @@ def _update_existing_model_dir(
         )
     except Exception:
         trace_sequence_length = None
+
+    requested_trace_length = getattr(args, "max_seq_len", None)
+    if requested_trace_length is not None and trace_sequence_length is not None:
+        if int(requested_trace_length) != int(trace_sequence_length):
+            die(
+                f"openvino_model.xml already exists with traced sequence length {trace_sequence_length}, "
+                f"but --max-seq-len {requested_trace_length} was requested. Re-run with `--force` "
+                "to rebuild the model body, or use a new --output-dir."
+            )
+
+    _save_tokenizer_and_configs(tokenizer, args.model, output_dir, local_files_only=args.local_files_only)
+    tokenizer_backend = _try_save_openvino_tokenizer(tokenizer, ov, openvino_tokenizers, output_dir)
 
     _write_conversion_info(
         output_dir,
@@ -291,7 +378,7 @@ def _update_existing_model_dir(
             "static_shapes": npu_target,
             "input_dtype": "int32" if npu_target else existing_info.get("input_dtype", "int64"),
             "uses_kv_cache": False,
-            "generator": "openvino_genai" if tokenizer_backend == "openvino" else "openvino_core_hf_tokenizer",
+            "generator": "openvino_core_hf_tokenizer",
         },
     )
     print(f"Updated existing OpenVINO model directory: {output_dir}", file=sys.stderr)
@@ -397,8 +484,9 @@ def _convert_model_from_transformers(
     except Exception as exc:
         die(
             "OpenVINO conversion failed for the PLaMo 3 custom PyTorch model. "
-            "This route avoids optimum-intel, but PLaMo 3 may still require a custom "
-            f"OpenVINO GenAI model adapter/exporter. Original error: {exc}"
+            "openvino-genai does not provide a Hugging Face model converter; this route uses "
+            "openvino.convert_model and then saves a model directory that OpenVINO GenAI can load "
+            f"when tokenizer conversion succeeds. Original error: {exc}"
         )
 
     compression_mode = _compression_mode_name(weight_format, npu_target=npu_target)
@@ -424,9 +512,9 @@ def _convert_model_from_transformers(
             "static_shapes": npu_target,
             "input_dtype": "int32" if npu_target else "int64",
             "uses_kv_cache": False,
-            "generator": "openvino_genai" if tokenizer_backend == "openvino" else "openvino_core_hf_tokenizer",
+            "generator": "openvino_core_hf_tokenizer",
         },
     )
 
-    print(f"Saved experimental OpenVINO GenAI model directory to: {output_dir}", file=sys.stderr)
+    print(f"Saved experimental OpenVINO model directory to: {output_dir}", file=sys.stderr)
     return 0

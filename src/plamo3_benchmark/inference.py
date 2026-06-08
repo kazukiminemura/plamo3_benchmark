@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -234,7 +235,18 @@ def load_generator(args: Any) -> Any:
     if not looks_like_openvino_dir(model_source):
         die(f"{model_source!r} does not look like an exported OpenVINO model. Run `plamo3-ov convert --output-dir ov-plamo3` first.")
 
-    has_openvino_tokenizer = (Path(model_source) / "openvino_tokenizer.xml").exists()
+    model_path = Path(model_source)
+    conversion_info_path = model_path / "plamo3_ov_conversion.json"
+    try:
+        conversion_info = (
+            json.loads(conversion_info_path.read_text(encoding="utf-8")) if conversion_info_path.exists() else {}
+        )
+    except Exception:
+        conversion_info = {}
+    if conversion_info.get("uses_kv_cache") is False:
+        return OpenVINOCoreGenerator(args)
+
+    has_openvino_tokenizer = (model_path / "openvino_tokenizer.xml").exists()
     if not has_openvino_tokenizer:
         return OpenVINOCoreGenerator(args)
     return OpenVINOGenAIGenerator(args)
