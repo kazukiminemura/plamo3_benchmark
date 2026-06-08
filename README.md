@@ -7,6 +7,7 @@ Python CLI です。Hugging Face 上の PLaMo 3 NICT 8B Base を OpenVINO IR に
 ## できること
 
 - Hugging Face の PLaMo 3 NICT 8B Base を OpenVINO IR へ変換
+- KV cache 付き IR での逐次推論
 - `fp32` / `fp16` / `int8` / `int4` の weight format を指定
 - CPU / GPU / NPU / AUTO などの OpenVINO device string で推論
 - 位置引数、ファイル、標準入力からプロンプトを投入
@@ -124,6 +125,7 @@ uv run plamo3-ov convert --output-dir ov-plamo3 --weight-format fp16
 - `--weight-format`: `fp32`、`fp16`、`int8`、`int4`
 - `--max-seq-len`: 変換時に使う固定シーケンス長
 - `--target-device`: 変換先デバイスの目安。`NPU` を指定すると固定 shape と int32 入力で変換
+- `--kv-cache` / `--no-kv-cache`: KV cache 付き IR を作るかどうか。既定は有効
 - `--force`: 既存の `openvino_model.xml` があっても再変換
 - `--local-files-only`: Hugging Face にアクセスせず、ローカル cache またはローカルモデルディレクトリだけを使う
 - `--trust-remote-code` / `--no-trust-remote-code`: custom code の許可
@@ -229,8 +231,11 @@ PLaMo 3 を変換します。
 PLaMo 3 の GQA attention は、変換時だけ K/V heads を明示的に展開して OpenVINO の
 `ScaledDotProductAttention` に渡します。
 
-推論では OpenVINO Core と Hugging Face tokenizer を組み合わせます。`--max-seq-len`
-で変換した固定長の範囲内で生成します。
+推論では OpenVINO Core と Hugging Face tokenizer を組み合わせます。既定では KV cache 付き
+IR を使い、prompt は一度だけ prefill して、その後は 1 token ずつ生成します。
+既存の非 KV cache IR を KV cache 付きに作り直す場合は、同じ `--output-dir` に対して
+`--force` を付けて再変換してください。
+`--no-kv-cache` で変換した場合は、`--max-seq-len` で変換した固定長の範囲内で生成します。
 `prompt length + --max-new-tokens` が固定長を超える場合、生成可能な最大トークン数へ
 自動調整し、stderr に警告を表示します。長い応答が必要な場合は、たとえば次のように
 大きめの `--max-seq-len` で再変換してください。

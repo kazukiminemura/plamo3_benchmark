@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -109,6 +110,14 @@ class OpenVINOGenerator:
         print(f"Using OpenVINO inference device: {args.device}", file=sys.stderr)
         self.compiled = core.compile_model(ov_model, args.device)
         self.compiled_output = self.compiled.output(0)
+        self.outputs = {item.get_any_name(): item for item in self.compiled.outputs}
+        self.info = self._read_info()
+
+    def _read_info(self) -> dict[str, Any]:
+        try:
+            return json.loads((self.model_dir / "plamo3_ov_conversion.json").read_text(encoding="utf-8"))
+        except Exception:
+            return {}
 
     @staticmethod
     def _numpy_dtype_for_ov_type(ov_type: Any, np: Any) -> Any:
@@ -117,9 +126,18 @@ class OpenVINOGenerator:
             return np.int32
         if type_name in {"i64", "<Type: 'int64_t'>"}:
             return np.int64
+        if type_name in {"f16", "<Type: 'float16'>"}:
+            return np.float16
+        if type_name in {"f32", "<Type: 'float32'>"}:
+            return np.float32
         return np.int64
 
     def generate(self, prompt: str, *, print_output: bool) -> str:
+        if self.info.get("uses_kv_cache"):
+            return self._generate_with_kv_cache(prompt, print_output=print_output)
+        return self._generate_full_context(prompt, print_output=print_output)
+
+    def _generate_full_context(self, prompt: str, *, print_output: bool) -> str:
         import numpy as np
 
         encoded = self.tokenizer(prompt, return_tensors="np")
@@ -163,6 +181,89 @@ class OpenVINOGenerator:
             generated.append(next_id)
             if self.args.stream and print_output:
                 print(self.tokenizer.decode([next_id], skip_special_tokens=True), end="", flush=True)
+
+        text = self.tokenizer.decode(generated, skip_special_tokens=True)
+        if self.args.stream and print_output:
+            print()
+        elif print_output:
+            print(text)
+        _print_generation_metrics(len(generated), start_time, first_token_time)
+        return text
+
+    def _empty_cache(self, np: Any) -> dict[str, Any]:
+        try:
+            layers = int(self.info["num_hidden_layers"])
+            kv_heads = int(self.info["num_key_value_heads"])
+            head_dim = int(self.info["head_dim"])
+        except KeyError as exc:
+            die(f"KV-cache model metadata is missing {exc.args[0]!r}; re-run convert with `--force`.")
+        return {
+            f"past.{layer_idx}.{kind}": np.zeros(
+                (1, kv_heads, 0, head_dim),
+                dtype=self.input_dtypes.get(f"past.{layer_idx}.{kind}", np.float32),
+            )
+            for layer_idx in range(layers)
+            for kind in ("key", "value")
+        }
+
+    def _present_to_past(self, result: Any) -> dict[str, Any]:
+        cache = {}
+        for name, output in self.outputs.items():
+            if name.startswith("present."):
+                cache[name.replace("present.", "past.", 1)] = result[output]
+        if not cache:
+            die("KV-cache outputs were not found in the OpenVINO model; re-run convert with `--force`.")
+        return cache
+
+    def _generate_with_kv_cache(self, prompt: str, *, print_output: bool) -> str:
+        import numpy as np
+
+        encoded = self.tokenizer(prompt, return_tensors="np")
+        input_dtype = self.input_dtypes.get("input_ids", np.int64)
+        mask_dtype = self.input_dtypes.get("attention_mask", input_dtype)
+        input_ids = encoded["input_ids"].astype(input_dtype)
+        prompt_len = int(input_ids.shape[1])
+
+        if print_output and not self.args.skip_prompt:
+            print(prompt, end="" if self.args.stream else "\n")
+
+        start_time = time.perf_counter()
+        inputs = {
+            "input_ids": input_ids,
+            "attention_mask": np.ones((1, prompt_len), dtype=mask_dtype),
+            **self._empty_cache(np),
+        }
+        result = self.compiled(inputs)
+        logits = result[self.compiled_output][0, -1]
+        cache = self._present_to_past(result)
+
+        generated: list[int] = []
+        eos_ids = {self.tokenizer.eos_token_id} if self.tokenizer.eos_token_id is not None else set()
+        first_token_time: float | None = None
+        total_len = prompt_len
+
+        for step in range(self.args.max_new_tokens):
+            next_id = _sample_next_token(logits, self.args)
+            if next_id in eos_ids:
+                break
+            if first_token_time is None:
+                first_token_time = time.perf_counter()
+            generated.append(next_id)
+            if self.args.stream and print_output:
+                print(self.tokenizer.decode([next_id], skip_special_tokens=True), end="", flush=True)
+
+            if step == self.args.max_new_tokens - 1:
+                break
+            total_len += 1
+            result = self.compiled(
+                {
+                    "input_ids": np.array([[next_id]], dtype=input_dtype),
+                    "attention_mask": np.ones((1, total_len), dtype=mask_dtype),
+                    **cache,
+                }
+            )
+            logits = result[self.compiled_output][0, -1]
+            cache = self._present_to_past(result)
 
         text = self.tokenizer.decode(generated, skip_special_tokens=True)
         if self.args.stream and print_output:

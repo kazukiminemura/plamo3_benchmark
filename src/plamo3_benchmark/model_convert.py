@@ -185,7 +185,10 @@ def _update_existing(args: Any, output_dir: Path, xml_path: Path, tokenizer: Any
     weight_format = _weight_format(args)
     trace_len = _trace_len(ov, xml_path)
 
-    if args.max_seq_len is not None and trace_len is not None and int(args.max_seq_len) != trace_len:
+    uses_kv_cache = bool(info.get("uses_kv_cache", False))
+    if args.kv_cache != uses_kv_cache:
+        die("Existing model KV-cache setting differs from --kv-cache; re-run with `--force`.")
+    if not uses_kv_cache and args.max_seq_len is not None and trace_len is not None and int(args.max_seq_len) != trace_len:
         die(
             f"openvino_model.xml already exists with traced sequence length {trace_len}, "
             f"but --max-seq-len {args.max_seq_len} was requested. Re-run with `--force`."
@@ -196,7 +199,7 @@ def _update_existing(args: Any, output_dir: Path, xml_path: Path, tokenizer: Any
         die("Existing model is not NPU static-shape/int32 IR; re-run with `--force`.")
 
     _save_tokenizer_and_configs(tokenizer, args, output_dir)
-    _write_info(output_dir, _conversion_info(args, weight_format, trace_len))
+    _write_info(output_dir, _conversion_info(args, weight_format, trace_len, uses_kv_cache=uses_kv_cache))
     print(f"Updated existing OpenVINO model directory: {output_dir}", file=sys.stderr)
     return 0
 
@@ -223,6 +226,31 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
                 return_dict=False,
             )[0]
 
+    class KVLogits(nn.Module):
+        def __init__(self, model: nn.Module, layers: int) -> None:
+            super().__init__()
+            self.model = model
+            self.layers = layers
+
+        def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, *past: torch.Tensor) -> tuple[Any, ...]:
+            from transformers.cache_utils import DynamicCache
+
+            cache = DynamicCache()
+            for layer_idx in range(self.layers):
+                cache.update(past[layer_idx * 2], past[layer_idx * 2 + 1], layer_idx)
+            out = self.model(
+                input_ids=input_ids.to(torch.long),
+                attention_mask=attention_mask.to(torch.long),
+                past_key_values=cache,
+                use_cache=True,
+                return_dict=True,
+            )
+            flat_cache = []
+            for layer_idx in range(self.layers):
+                key, value = out.past_key_values[layer_idx]
+                flat_cache.extend([key, value])
+            return (out.logits, *flat_cache)
+
     weight_format = _weight_format(args)
     npu = _is_npu(args.target_device)
     dtype = torch.float16 if weight_format in {"fp16", "int8", "int4"} else torch.float32
@@ -235,33 +263,66 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
         low_cpu_mem_usage=True,
         local_files_only=args.local_files_only,
     ).eval()
-    model.config.use_cache = False
+    model.config.use_cache = bool(args.kv_cache)
 
     token_dtype = torch.int32 if npu else torch.long
-    if args.max_seq_len is None:
-        encoded = tokenizer("こんにちは", return_tensors="pt")
-    else:
-        pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
+    if args.kv_cache:
         encoded = {
-            "input_ids": torch.full((1, args.max_seq_len), pad_id, dtype=token_dtype),
-            "attention_mask": torch.ones((1, args.max_seq_len), dtype=token_dtype),
+            "input_ids": torch.tensor([[tokenizer.bos_token_id or 1]], dtype=token_dtype),
+            "attention_mask": torch.ones((1, 1), dtype=token_dtype),
         }
+    else:
+        if args.max_seq_len is None:
+            encoded = tokenizer("こんにちは", return_tensors="pt")
+        else:
+            pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
+            encoded = {
+                "input_ids": torch.full((1, args.max_seq_len), pad_id, dtype=token_dtype),
+                "attention_mask": torch.ones((1, args.max_seq_len), dtype=token_dtype),
+            }
     if npu:
         encoded = {name: tensor.to(torch.int32) for name, tensor in encoded.items()}
 
     print("Converting PyTorch model with openvino.convert_model...", file=sys.stderr)
+    if args.kv_cache:
+        layers = int(getattr(model.config, "num_hidden_layers"))
+        kv_heads = int(getattr(model.config, "num_key_value_heads"))
+        head_dim = int(getattr(model.config, "head_dim"))
+        example_past = tuple(torch.zeros((1, kv_heads, 0, head_dim), dtype=dtype) for _ in range(layers * 2))
+        wrapped_model = KVLogits(model, layers).eval()
+        example_input = (encoded["input_ids"], encoded["attention_mask"], *example_past)
+    else:
+        wrapped_model = LogitsOnly(model).eval()
+        example_input = (encoded["input_ids"], encoded["attention_mask"])
     with _patch_gqa_attention(torch):
         ov_model = ov.convert_model(
-            LogitsOnly(model).eval(),
-            example_input=(encoded["input_ids"], encoded["attention_mask"]),
+            wrapped_model,
+            example_input=example_input,
             dynamo=True,
         )
 
+    ov_model.inputs[0].get_tensor().set_names({"input_ids"})
+    ov_model.inputs[1].get_tensor().set_names({"attention_mask"})
+    ov_model.outputs[0].get_tensor().set_names({"logits"})
+
     trace_len = int(encoded["input_ids"].shape[1])
-    shapes = {
-        "input_ids": ov.PartialShape([1, trace_len] if npu else [-1, -1]),
-        "attention_mask": ov.PartialShape([1, trace_len] if npu else [-1, -1]),
-    }
+    if args.kv_cache:
+        shapes = {
+            "input_ids": ov.PartialShape([1, -1]),
+            "attention_mask": ov.PartialShape([1, -1]),
+        }
+        for layer_idx in range(layers):
+            shapes[f"past.{layer_idx}.key"] = ov.PartialShape([1, kv_heads, -1, head_dim])
+            shapes[f"past.{layer_idx}.value"] = ov.PartialShape([1, kv_heads, -1, head_dim])
+        for idx, input_node in enumerate(ov_model.inputs[2:]):
+            input_node.get_tensor().set_names({f"past.{idx // 2}.{'key' if idx % 2 == 0 else 'value'}"})
+        for idx, output_node in enumerate(ov_model.outputs[1:]):
+            output_node.get_tensor().set_names({f"present.{idx // 2}.{'key' if idx % 2 == 0 else 'value'}"})
+    else:
+        shapes = {
+            "input_ids": ov.PartialShape([1, trace_len] if npu else [-1, -1]),
+            "attention_mask": ov.PartialShape([1, trace_len] if npu else [-1, -1]),
+        }
     try:
         ov_model.reshape(shapes)
     except Exception:
@@ -272,14 +333,14 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
     ov_model = _compress_weights(ov_model, weight_format, npu=npu)
     _save_model(ov, ov_model, output_dir / "openvino_model.xml", fp16=weight_format == "fp16")
     _save_tokenizer_and_configs(tokenizer, args, output_dir)
-    _write_info(output_dir, _conversion_info(args, weight_format, trace_len))
+    _write_info(output_dir, _conversion_info(args, weight_format, trace_len, uses_kv_cache=bool(args.kv_cache)))
     print(f"Saved OpenVINO model directory to: {output_dir}", file=sys.stderr)
     return 0
 
 
-def _conversion_info(args: Any, weight_format: str, trace_len: int | None) -> dict[str, Any]:
+def _conversion_info(args: Any, weight_format: str, trace_len: int | None, *, uses_kv_cache: bool) -> dict[str, Any]:
     npu = _is_npu(args.target_device)
-    return {
+    info = {
         "model": args.model,
         "weight_format": weight_format,
         "target_device": args.target_device,
@@ -287,4 +348,19 @@ def _conversion_info(args: Any, weight_format: str, trace_len: int | None) -> di
         "trace_sequence_length": trace_len,
         "static_shapes": npu,
         "input_dtype": "int32" if npu else "int64",
+        "uses_kv_cache": uses_kv_cache,
     }
+    if uses_kv_cache:
+        config_path = Path(args.output_dir) / "config.json"
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            info.update(
+                {
+                    "num_hidden_layers": config["num_hidden_layers"],
+                    "num_key_value_heads": config["num_key_value_heads"],
+                    "head_dim": config["head_dim"],
+                }
+            )
+        except Exception:
+            pass
+    return info

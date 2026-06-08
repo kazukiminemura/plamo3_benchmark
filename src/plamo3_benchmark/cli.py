@@ -61,6 +61,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     convert_parser.add_argument(
+        "--kv-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Export a model with flat past-key-value inputs/outputs for incremental inference.",
+    )
+    convert_parser.add_argument(
         "--force",
         action="store_true",
         help="Reconvert the OpenVINO model even if openvino_model.xml already exists.",
