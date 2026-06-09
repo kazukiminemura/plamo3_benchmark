@@ -6,7 +6,25 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .common import die, import_auto_tokenizer, looks_like_openvino_dir
+import numpy as np
+import openvino as ov
+from .common import die, looks_like_openvino_dir
+from transformers import AutoTokenizer
+
+try:
+    import openvino_genai as ov_genai
+except ImportError as exc:
+    die("openvino-genai is not installed. Run `uv sync` first.")
+    raise exc
+
+
+def _generation_config(args: Any) -> Any:
+    config = ov_genai.GenerationConfig()
+    config.max_new_tokens = args.max_new_tokens
+    config.temperature = args.temperature
+    config.top_p = args.top_p
+    config.top_k = args.top_k
+    return config
 
 
 def read_prompt(args: Any) -> str:
@@ -26,8 +44,6 @@ def read_prompt(args: Any) -> str:
 
 
 def _sample_next_token(logits: Any, args: Any) -> int:
-    import numpy as np
-
     logits = logits.astype("float64")
     if args.temperature <= 0:
         return int(np.argmax(logits))
@@ -52,6 +68,17 @@ def _sample_next_token(logits: Any, args: Any) -> int:
     return int(np.random.choice(np.arange(probs.shape[-1]), p=probs))
 
 
+def _format_chat_prompt(messages: list[dict[str, str]], system_prompt: str | None) -> str:
+    parts: list[str] = []
+    if system_prompt:
+        parts.append(f"System: {system_prompt.strip()}")
+    for message in messages:
+        role = "User" if message["role"] == "user" else "Assistant"
+        parts.append(f"{role}: {message['content'].strip()}")
+    parts.append("Assistant:")
+    return "\n".join(parts)
+
+
 def _print_generation_metrics(token_count: int, start_time: float, first_token_time: float | None) -> None:
     total_time = max(time.perf_counter() - start_time, 1e-9)
     fttt_text = "n/a" if first_token_time is None else f"{first_token_time - start_time:.3f}s"
@@ -63,68 +90,114 @@ def _print_generation_metrics(token_count: int, start_time: float, first_token_t
     )
 
 
-def _resolve_fallback_max_new_tokens(prompt_len: int, requested_max_new_tokens: int, trace_len: int) -> int:
-    available_new_tokens = trace_len - prompt_len
-    if available_new_tokens <= 0:
-        die(
-            f"Prompt length ({prompt_len}) reaches the traced sequence length ({trace_len}). "
-            "Use /reset to clear chat history, shorten the prompt, or re-run convert with a larger "
-            f"`--max-seq-len`, for example `--max-seq-len {max(trace_len * 2, prompt_len + 128)}`."
-        )
+class OpenVINOGenAIGenerator:
+    uses_native_chat = True
 
-    if requested_max_new_tokens > available_new_tokens:
-        print(
-            f"warning: max_new_tokens ({requested_max_new_tokens}) exceeds the remaining traced "
-            f"sequence length ({available_new_tokens}); generating at most {available_new_tokens} "
-            "new tokens. Re-run convert with a larger "
-            f"`--max-seq-len`, for example `--max-seq-len {prompt_len + requested_max_new_tokens}`.",
-            file=sys.stderr,
-        )
-        return available_new_tokens
-
-    return requested_max_new_tokens
-
-
-class OpenVINOGenerator:
     def __init__(self, args: Any) -> None:
-        import openvino as ov
-        import numpy as np
+        self.args = args
+        self.config = _generation_config(args)
+        self.tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, use_fast=False)
+        self._check_genai_model_inputs(Path(args.model))
+        print(f"Using OpenVINO GenAI inference device: {args.device}", file=sys.stderr)
+        self.pipe = ov_genai.LLMPipeline(str(args.model), args.device)
+        self.pipe.set_generation_config(self.config)
 
+    @staticmethod
+    def _check_genai_model_inputs(model_dir: Path) -> None:
+        input_names = {item.get_any_name() for item in ov.Core().read_model(model_dir / "openvino_model.xml").inputs}
+        if "beam_idx" not in input_names:
+            try:
+                info = json.loads((model_dir / "plamo3_ov_conversion.json").read_text(encoding="utf-8"))
+            except Exception:
+                info = {}
+            command = (
+                f"plamo3-ov convert --output-dir {model_dir} "
+                f"--weight-format {info.get('weight_format', 'fp16')} "
+                f"--target-device {info.get('target_device', 'CPU')} --force"
+            )
+            die(
+                "This OpenVINO model was exported before GenAI support and is missing `beam_idx`. "
+                f"Re-run `{command}`."
+            )
+
+    def _encode(self, prompt: str) -> tuple[Any, int]:
+        encoded = self.tokenizer(prompt, return_tensors="np")
+        input_ids = encoded["input_ids"].astype(np.int64)
+        attention_mask = encoded["attention_mask"].astype(np.int64)
+        return (
+            ov_genai.TokenizedInputs(
+                ov.Tensor(input_ids),
+                ov.Tensor(attention_mask),
+            ),
+            int(input_ids.shape[1]),
+        )
+
+    def _decode_result(self, result: Any, prompt_len: int) -> str:
+        if hasattr(result, "texts"):
+            return "".join(result.texts)
+
+        tokens = getattr(result, "tokens", result)
+        token_array = np.array(tokens.data if hasattr(tokens, "data") else tokens)
+        if token_array.ndim > 1:
+            token_array = token_array[0]
+
+        token_ids = token_array.astype(np.int64).tolist()
+        if len(token_ids) > prompt_len:
+            token_ids = token_ids[prompt_len:]
+        return self.tokenizer.decode(token_ids, skip_special_tokens=True)
+
+    def generate(self, prompt: str, *, print_output: bool) -> str:
+        inputs, prompt_len = self._encode(prompt)
+        if self.args.stream and print_output:
+            chunks: list[str] = []
+
+            def streamer(token: Any) -> bool:
+                if isinstance(token, str):
+                    text = token
+                else:
+                    text = self.tokenizer.decode([int(token)], skip_special_tokens=True)
+                chunks.append(text)
+                print(text, end="", flush=True)
+                return False
+
+            result = self.pipe.generate(inputs, self.config, streamer)
+            print()
+            return "".join(chunks) if chunks else self._decode_result(result, prompt_len)
+
+        text = self._decode_result(self.pipe.generate(inputs, self.config), prompt_len)
+        if print_output:
+            print(text)
+        return text
+
+    def start_chat(self, system_message: str = "") -> None:
+        self.pipe.start_chat(system_message)
+
+    def finish_chat(self) -> None:
+        self.pipe.finish_chat()
+
+
+class DirectOpenVINOGenerator:
+    uses_native_chat = False
+
+    def __init__(self, args: Any) -> None:
         self.args = args
         self.model_dir = Path(args.model)
-        self.tokenizer = import_auto_tokenizer().from_pretrained(self.model_dir, trust_remote_code=True, use_fast=False)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir, trust_remote_code=True, use_fast=False)
         core = ov.Core()
-        ov_model = core.read_model(self.model_dir / "openvino_model.xml")
-        self.model_output = ov_model.output(0)
-        self.input_names = {item.get_any_name(): item for item in ov_model.inputs}
-        self.input_dtypes = {
-            name: self._numpy_dtype_for_ov_type(input_node.get_element_type(), np)
-            for name, input_node in self.input_names.items()
-        }
+        model = core.read_model(self.model_dir / "openvino_model.xml")
+        self.input_names = {item.get_any_name(): item for item in model.inputs}
+        self.output = model.output(0)
+        output_shape = list(model.output(0).get_partial_shape())
+        self.trace_len = output_shape[1].get_length() if len(output_shape) > 1 and output_shape[1].is_static else None
+        if self.trace_len is None:
+            input_shape = list(self.input_names["input_ids"].get_partial_shape())
+            self.trace_len = input_shape[1].get_length() if len(input_shape) > 1 and input_shape[1].is_static else None
+        if self.trace_len is None:
+            self.trace_len = int(self._read_info().get("trace_sequence_length") or 512)
 
-        input_shape = list(self.input_names["input_ids"].get_partial_shape()) if "input_ids" in self.input_names else []
-        self.trace_len = input_shape[1].get_length() if len(input_shape) >= 2 and input_shape[1].is_static else None
-        self.info = self._read_info()
-        if self.info.get("uses_kv_cache") and self.info.get("kv_cache_format_version") != 3:
-            weight_format = self.info.get("weight_format", "fp16")
-            target_device = self.info.get("target_device", "CPU")
-            max_seq_len = self.info.get("kv_cache_context_length", self.info.get("trace_sequence_length", 1024))
-            die(
-                "This KV-cache OpenVINO model was exported with an older cache format that can produce "
-                "repeated-token output. Re-run `plamo3-ov convert "
-                f"--output-dir {self.model_dir} --weight-format {weight_format} "
-                f"--target-device {target_device} --max-seq-len {max_seq_len} --force`."
-            )
-        if self.info.get("uses_kv_cache") and "GPU" in str(args.device).upper():
-            die(
-                "OpenVINO GPU produces repeated-token output with this exported KV-cache graph. "
-                "Re-run convert with `--no-kv-cache`, then use `--device GPU` again."
-            )
-
-        print(f"Using OpenVINO inference device: {args.device}", file=sys.stderr)
-        self.compiled = core.compile_model(ov_model, args.device)
+        print(f"Using direct OpenVINO inference device: {args.device}", file=sys.stderr)
+        self.compiled = core.compile_model(model, args.device)
         self.compiled_output = self.compiled.output(0)
-        self.outputs = {item.get_any_name(): item for item in self.compiled.outputs}
 
     def _read_info(self) -> dict[str, Any]:
         try:
@@ -132,50 +205,21 @@ class OpenVINOGenerator:
         except Exception:
             return {}
 
-    @staticmethod
-    def _numpy_dtype_for_ov_type(ov_type: Any, np: Any) -> Any:
-        type_name = str(ov_type)
-        if type_name in {"i32", "<Type: 'int32_t'>"}:
-            return np.int32
-        if type_name in {"i64", "<Type: 'int64_t'>"}:
-            return np.int64
-        if type_name in {"f16", "<Type: 'float16'>"}:
-            return np.float16
-        if type_name in {"f32", "<Type: 'float32'>"}:
-            return np.float32
-        return np.int64
-
     def generate(self, prompt: str, *, print_output: bool) -> str:
-        if self.info.get("uses_kv_cache"):
-            return self._generate_with_kv_cache(prompt, print_output=print_output)
-        return self._generate_full_context(prompt, print_output=print_output)
-
-    def _generate_full_context(self, prompt: str, *, print_output: bool) -> str:
-        import numpy as np
-
         encoded = self.tokenizer(prompt, return_tensors="np")
-        input_dtype = self.input_dtypes.get("input_ids", np.int64)
-        mask_dtype = self.input_dtypes.get("attention_mask", input_dtype)
-        input_ids = encoded["input_ids"].astype(input_dtype)
+        input_ids = encoded["input_ids"].astype(np.int64)
+        attention_mask = encoded["attention_mask"].astype(np.int64)
         prompt_len = int(input_ids.shape[1])
-        attention_mask = encoded["attention_mask"].astype(mask_dtype)
-        metadata_trace_len = int(self.info.get("trace_sequence_length") or 0)
-        if self.trace_len is None and metadata_trace_len > prompt_len:
-            trace_len = metadata_trace_len
-            max_new_tokens = _resolve_fallback_max_new_tokens(prompt_len, self.args.max_new_tokens, trace_len)
-        elif self.trace_len is None:
-            trace_len = prompt_len + self.args.max_new_tokens
-            max_new_tokens = self.args.max_new_tokens
-        else:
-            trace_len = self.trace_len
-            max_new_tokens = _resolve_fallback_max_new_tokens(prompt_len, self.args.max_new_tokens, trace_len)
+        if prompt_len >= self.trace_len:
+            die(
+                f"Prompt length ({prompt_len}) reaches the traced sequence length ({self.trace_len}). "
+                "Use /reset, shorten the prompt, or reconvert with a larger --max-seq-len."
+            )
 
-        tokens = np.full(
-            (1, trace_len),
-            self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0,
-            dtype=input_dtype,
-        )
-        mask = np.zeros((1, trace_len), dtype=mask_dtype)
+        max_new_tokens = min(self.args.max_new_tokens, self.trace_len - prompt_len)
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0
+        tokens = np.full((1, self.trace_len), pad_id, dtype=np.int64)
+        mask = np.zeros((1, self.trace_len), dtype=np.int64)
         tokens[:, :prompt_len] = input_ids
         mask[:, :prompt_len] = attention_mask
 
@@ -183,9 +227,6 @@ class OpenVINOGenerator:
         eos_ids = {self.tokenizer.eos_token_id} if self.tokenizer.eos_token_id is not None else set()
         start_time = time.perf_counter()
         first_token_time: float | None = None
-
-        if print_output and not self.args.skip_prompt:
-            print(prompt, end="" if self.args.stream else "\n")
 
         for position in range(prompt_len, prompt_len + max_new_tokens):
             inputs = {"input_ids": tokens, "attention_mask": mask}
@@ -211,114 +252,41 @@ class OpenVINOGenerator:
         _print_generation_metrics(len(generated), start_time, first_token_time)
         return text
 
-    def _empty_cache(self, np: Any) -> dict[str, Any]:
-        try:
-            layers = int(self.info["num_hidden_layers"])
-            kv_heads = int(self.info["num_key_value_heads"])
-            head_dim = int(self.info["head_dim"])
-            past_len = int(self.info["kv_cache_past_length"])
-        except KeyError as exc:
-            die(f"KV-cache model metadata is missing {exc.args[0]!r}; re-run convert with `--force`.")
-        return {
-            f"past.{layer_idx}.{kind}": np.zeros(
-                (1, kv_heads, past_len, head_dim),
-                dtype=self.input_dtypes.get(f"past.{layer_idx}.{kind}", np.float32),
-            )
-            for layer_idx in range(layers)
-            for kind in ("key", "value")
-        }
+    def start_chat(self, system_message: str = "") -> None:
+        return None
 
-    @staticmethod
-    def _kv_attention_mask(np: Any, context_len: int, active_tokens: int, dtype: Any) -> Any:
-        mask = np.zeros((1, context_len), dtype=dtype)
-        mask[:, -min(active_tokens, context_len) :] = 1
-        return mask
-
-    def _present_to_past(self, result: Any) -> dict[str, Any]:
-        cache = {}
-        for name, output in self.outputs.items():
-            if name.startswith("present."):
-                cache[name.replace("present.", "past.", 1)] = result[output]
-        if not cache:
-            die("KV-cache outputs were not found in the OpenVINO model; re-run convert with `--force`.")
-        return cache
-
-    def _generate_with_kv_cache(self, prompt: str, *, print_output: bool) -> str:
-        import numpy as np
-
-        encoded = self.tokenizer(prompt, return_tensors="np")
-        input_dtype = self.input_dtypes.get("input_ids", np.int64)
-        mask_dtype = self.input_dtypes.get("attention_mask", input_dtype)
-        input_ids = encoded["input_ids"].astype(input_dtype)
-
-        if print_output and not self.args.skip_prompt:
-            print(prompt, end="" if self.args.stream else "\n")
-
-        start_time = time.perf_counter()
-        context_len = int(self.info.get("kv_cache_context_length", self.info.get("trace_sequence_length", 0)))
-        if context_len <= 1:
-            die("KV-cache model metadata has an invalid context length; re-run convert with `--force`.")
-        cache = self._empty_cache(np)
-        logits = None
-        processed_tokens = 0
-        position_dtype = self.input_dtypes.get("cache_position", input_dtype)
-        for token_id in input_ids[0].tolist():
-            processed_tokens += 1
-            result = self.compiled(
-                {
-                    "input_ids": np.array([[token_id]], dtype=input_dtype),
-                    "attention_mask": self._kv_attention_mask(np, context_len, processed_tokens, mask_dtype),
-                    "cache_position": np.array([processed_tokens - 1], dtype=position_dtype),
-                    **cache,
-                }
-            )
-            logits = result[self.compiled_output][0, -1]
-            cache = self._present_to_past(result)
-
-        generated: list[int] = []
-        eos_ids = {self.tokenizer.eos_token_id} if self.tokenizer.eos_token_id is not None else set()
-        first_token_time: float | None = None
-
-        for step in range(self.args.max_new_tokens):
-            if logits is None:
-                break
-            next_id = _sample_next_token(logits, self.args)
-            if next_id in eos_ids:
-                break
-            if first_token_time is None:
-                first_token_time = time.perf_counter()
-            generated.append(next_id)
-            if self.args.stream and print_output:
-                print(self.tokenizer.decode([next_id], skip_special_tokens=True), end="", flush=True)
-
-            if step == self.args.max_new_tokens - 1:
-                break
-            processed_tokens += 1
-            result = self.compiled(
-                {
-                    "input_ids": np.array([[next_id]], dtype=input_dtype),
-                    "attention_mask": self._kv_attention_mask(np, context_len, processed_tokens, mask_dtype),
-                    "cache_position": np.array([processed_tokens - 1], dtype=position_dtype),
-                    **cache,
-                }
-            )
-            logits = result[self.compiled_output][0, -1]
-            cache = self._present_to_past(result)
-
-        text = self.tokenizer.decode(generated, skip_special_tokens=True)
-        if self.args.stream and print_output:
-            print()
-        elif print_output:
-            print(text)
-        _print_generation_metrics(len(generated), start_time, first_token_time)
-        return text
+    def finish_chat(self) -> None:
+        return None
 
 
-def load_generator(args: Any) -> Any:
+def _is_genai_compatible(model_dir: Path) -> bool:
+    tokenizer_exists = (model_dir / "openvino_tokenizer.xml").exists() and (model_dir / "openvino_detokenizer.xml").exists()
+    if not tokenizer_exists:
+        return False
+    model = ov.Core().read_model(model_dir / "openvino_model.xml")
+    input_names = {item.get_any_name() for item in model.inputs}
+    if "beam_idx" not in input_names:
+        return False
+    output_shape = list(model.output(0).get_partial_shape())
+    return len(output_shape) < 2 or output_shape[1].is_dynamic
+
+
+def load_generator(args: Any) -> OpenVINOGenAIGenerator:
     model_source = args.model
     if not looks_like_openvino_dir(model_source):
-        die(f"{model_source!r} does not look like an exported OpenVINO model. Run `plamo3-ov convert --output-dir ov-plamo3` first.")
-    return OpenVINOGenerator(args)
+        die(
+            f"{model_source!r} does not look like an exported OpenVINO model. "
+            "Run `plamo3-ov convert --output-dir ov-plamo3` first."
+        )
+    model_dir = Path(model_source)
+    if _is_genai_compatible(model_dir):
+        return OpenVINOGenAIGenerator(args)
+    print(
+        "warning: model is not fully compatible with OpenVINO GenAI chat; "
+        "falling back to direct OpenVINO generation.",
+        file=sys.stderr,
+    )
+    return DirectOpenVINOGenerator(args)
 
 
 def generate(args: Any) -> int:
@@ -328,21 +296,7 @@ def generate(args: Any) -> int:
     return 0
 
 
-def format_chat_prompt(messages: list[dict[str, str]], system_prompt: str | None) -> str:
-    parts: list[str] = []
-    if system_prompt:
-        parts.append(f"System: {system_prompt.strip()}")
-    for message in messages:
-        role = "User" if message["role"] == "user" else "Assistant"
-        parts.append(f"{role}: {message['content'].strip()}")
-    parts.append("Assistant:")
-    return "\n".join(parts)
-
-
 def chat(args: Any) -> int:
-    if not looks_like_openvino_dir(args.model):
-        die(f"{args.model!r} does not look like an exported OpenVINO model. Run `plamo3-ov convert --output-dir ov-plamo3` first.")
-
     generator = load_generator(args)
     print(
         "PLaMo 3 chat. Model is loaded once for this session. "
@@ -350,30 +304,39 @@ def chat(args: Any) -> int:
         file=sys.stderr,
     )
     messages: list[dict[str, str]] = []
-    turns = 0
-    while True:
-        try:
-            user_text = input("you> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return 0
+    generator.start_chat(args.system or "")
+    try:
+        turns = 0
+        while True:
+            try:
+                user_text = input("you> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 0
 
-        if not user_text:
-            continue
-        if user_text in {"/exit", "/quit"}:
-            return 0
-        if user_text == "/reset":
-            messages.clear()
-            turns = 0
-            print("history reset", file=sys.stderr)
-            continue
+            if not user_text:
+                continue
+            if user_text in {"/exit", "/quit"}:
+                return 0
+            if user_text == "/reset":
+                generator.finish_chat()
+                messages.clear()
+                generator.start_chat(args.system or "")
+                turns = 0
+                print("history reset", file=sys.stderr)
+                continue
 
-        messages.append({"role": "user", "content": user_text})
-        prompt = format_chat_prompt(messages, args.system)
-        print("assistant> ", end="", flush=True)
-        assistant_text = generator.generate(prompt, print_output=True).strip()
-        messages.append({"role": "assistant", "content": assistant_text})
-        turns += 1
+            print("assistant> ", end="", flush=True)
+            if generator.uses_native_chat:
+                assistant_text = generator.generate(user_text, print_output=True).strip()
+            else:
+                messages.append({"role": "user", "content": user_text})
+                prompt = _format_chat_prompt(messages, args.system)
+                assistant_text = generator.generate(prompt, print_output=True).strip()
+                messages.append({"role": "assistant", "content": assistant_text})
+            turns += 1
 
-        if args.max_turns is not None and turns >= args.max_turns:
-            return 0
+            if args.max_turns is not None and turns >= args.max_turns:
+                return 0
+    finally:
+        generator.finish_chat()

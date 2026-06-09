@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from openvino_tokenizers import convert_tokenizer
+
 from .common import check_hugging_face_access, die, import_auto_tokenizer, is_local_model_path
 
 
@@ -103,7 +105,7 @@ def _write_json_if_present(model: str, output_dir: Path, filename: str, *, local
     (output_dir / filename).write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
 
 
-def _save_tokenizer_and_configs(tokenizer: Any, args: Any, output_dir: Path) -> None:
+def _save_tokenizer_and_configs(ov: Any, tokenizer: Any, args: Any, output_dir: Path) -> None:
     for name in (
         "openvino_tokenizer.xml",
         "openvino_tokenizer.bin",
@@ -115,6 +117,16 @@ def _save_tokenizer_and_configs(tokenizer: Any, args: Any, output_dir: Path) -> 
         if path.exists():
             path.unlink()
     tokenizer.save_pretrained(output_dir)
+    try:
+        ov_tokenizer, ov_detokenizer = convert_tokenizer(tokenizer, with_detokenizer=True)
+        ov.save_model(ov_tokenizer, output_dir / "openvino_tokenizer.xml")
+        ov.save_model(ov_detokenizer, output_dir / "openvino_detokenizer.xml")
+    except Exception as exc:
+        print(
+            "warning: failed to convert tokenizer to OpenVINO IR; inference will use the "
+            f"Hugging Face tokenizer fallback. Original error: {exc}",
+            file=sys.stderr,
+        )
     _write_json_if_present(args.model, output_dir, "config.json", local_files_only=args.local_files_only)
     _write_json_if_present(args.model, output_dir, "generation_config.json", local_files_only=args.local_files_only)
     if not (output_dir / "generation_config.json").exists():
@@ -188,6 +200,9 @@ def _update_existing(args: Any, output_dir: Path, xml_path: Path, tokenizer: Any
     uses_kv_cache = bool(info.get("uses_kv_cache", False))
     if args.kv_cache != uses_kv_cache:
         die("Existing model KV-cache setting differs from --kv-cache; re-run with `--force`.")
+    input_names = {item.get_any_name() for item in ov.Core().read_model(xml_path).inputs}
+    if not uses_kv_cache and "beam_idx" not in input_names:
+        die("Existing model is missing the GenAI `beam_idx` input; re-run convert with `--force`.")
     if not uses_kv_cache and args.max_seq_len is not None and trace_len is not None and int(args.max_seq_len) != trace_len:
         die(
             f"openvino_model.xml already exists with traced sequence length {trace_len}, "
@@ -198,7 +213,7 @@ def _update_existing(args: Any, output_dir: Path, xml_path: Path, tokenizer: Any
     if _is_npu(args.target_device) and (info.get("static_shapes") is not True or info.get("input_dtype") != "int32"):
         die("Existing model is not NPU static-shape/int32 IR; re-run with `--force`.")
 
-    _save_tokenizer_and_configs(tokenizer, args, output_dir)
+    _save_tokenizer_and_configs(ov, tokenizer, args, output_dir)
     _write_info(output_dir, _conversion_info(args, weight_format, trace_len, uses_kv_cache=uses_kv_cache))
     print(f"Updated existing OpenVINO model directory: {output_dir}", file=sys.stderr)
     return 0
@@ -218,13 +233,19 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
             super().__init__()
             self.model = model
 
-        def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-            return self.model(
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
+            beam_idx: torch.Tensor,
+        ) -> torch.Tensor:
+            logits = self.model(
                 input_ids=input_ids.to(torch.long),
                 attention_mask=attention_mask.to(torch.long),
                 use_cache=False,
                 return_dict=False,
             )[0]
+            return logits + beam_idx.to(logits.dtype).reshape(-1, 1, 1) * 0
 
     class KVLogits(nn.Module):
         def __init__(self, model: nn.Module, layers: int, past_len: int) -> None:
@@ -376,6 +397,7 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
         encoded = {
             "input_ids": torch.full((1, args.max_seq_len), pad_id, dtype=token_dtype),
             "attention_mask": torch.ones((1, args.max_seq_len), dtype=token_dtype),
+            "beam_idx": torch.tensor([0], dtype=torch.int32),
         }
     if token_dtype == torch.int32:
         encoded = {name: tensor.to(torch.int32) for name, tensor in encoded.items()}
@@ -391,7 +413,7 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
         example_input = (encoded["input_ids"], encoded["attention_mask"], encoded["cache_position"], *example_past)
     else:
         wrapped_model = LogitsOnly(model).eval()
-        example_input = (encoded["input_ids"], encoded["attention_mask"])
+        example_input = (encoded["input_ids"], encoded["attention_mask"], encoded["beam_idx"])
     with _patch_gqa_attention(torch):
         ov_model = ov.convert_model(
             wrapped_model,
@@ -403,6 +425,8 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
     ov_model.inputs[1].get_tensor().set_names({"attention_mask"})
     if args.kv_cache:
         ov_model.inputs[2].get_tensor().set_names({"cache_position"})
+    else:
+        ov_model.inputs[2].get_tensor().set_names({"beam_idx"})
     ov_model.outputs[0].get_tensor().set_names({"logits"})
 
     trace_len = int(encoded["input_ids"].shape[1])
@@ -423,6 +447,7 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
         shapes = {
             "input_ids": ov.PartialShape([1, trace_len] if npu else [-1, -1]),
             "attention_mask": ov.PartialShape([1, trace_len] if npu else [-1, -1]),
+            "beam_idx": ov.PartialShape([1] if npu else [-1]),
         }
     try:
         ov_model.reshape(shapes)
@@ -433,7 +458,7 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
 
     ov_model = _compress_weights(ov_model, weight_format, npu=npu)
     _save_model(ov, ov_model, output_dir / "openvino_model.xml", fp16=weight_format == "fp16")
-    _save_tokenizer_and_configs(tokenizer, args, output_dir)
+    _save_tokenizer_and_configs(ov, tokenizer, args, output_dir)
     _write_info(output_dir, _conversion_info(args, weight_format, trace_len, uses_kv_cache=bool(args.kv_cache)))
     print(f"Saved OpenVINO model directory to: {output_dir}", file=sys.stderr)
     return 0
