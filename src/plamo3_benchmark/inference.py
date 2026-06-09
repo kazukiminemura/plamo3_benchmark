@@ -102,16 +102,29 @@ class OpenVINOGenerator:
             for name, input_node in self.input_names.items()
         }
 
-        result_shape = list(self.model_output.get_partial_shape())
-        self.trace_len = (
-            result_shape[1].get_length() if len(result_shape) >= 2 and result_shape[1].is_static else None
-        )
+        input_shape = list(self.input_names["input_ids"].get_partial_shape()) if "input_ids" in self.input_names else []
+        self.trace_len = input_shape[1].get_length() if len(input_shape) >= 2 and input_shape[1].is_static else None
+        self.info = self._read_info()
+        if self.info.get("uses_kv_cache") and self.info.get("kv_cache_format_version") != 3:
+            weight_format = self.info.get("weight_format", "fp16")
+            target_device = self.info.get("target_device", "CPU")
+            max_seq_len = self.info.get("kv_cache_context_length", self.info.get("trace_sequence_length", 1024))
+            die(
+                "This KV-cache OpenVINO model was exported with an older cache format that can produce "
+                "repeated-token output. Re-run `plamo3-ov convert "
+                f"--output-dir {self.model_dir} --weight-format {weight_format} "
+                f"--target-device {target_device} --max-seq-len {max_seq_len} --force`."
+            )
+        if self.info.get("uses_kv_cache") and "GPU" in str(args.device).upper():
+            die(
+                "OpenVINO GPU produces repeated-token output with this exported KV-cache graph. "
+                "Re-run convert with `--no-kv-cache`, then use `--device GPU` again."
+            )
 
         print(f"Using OpenVINO inference device: {args.device}", file=sys.stderr)
         self.compiled = core.compile_model(ov_model, args.device)
         self.compiled_output = self.compiled.output(0)
         self.outputs = {item.get_any_name(): item for item in self.compiled.outputs}
-        self.info = self._read_info()
 
     def _read_info(self) -> dict[str, Any]:
         try:
@@ -146,8 +159,16 @@ class OpenVINOGenerator:
         input_ids = encoded["input_ids"].astype(input_dtype)
         prompt_len = int(input_ids.shape[1])
         attention_mask = encoded["attention_mask"].astype(mask_dtype)
-        trace_len = self.trace_len or prompt_len
-        max_new_tokens = _resolve_fallback_max_new_tokens(prompt_len, self.args.max_new_tokens, trace_len)
+        metadata_trace_len = int(self.info.get("trace_sequence_length") or 0)
+        if self.trace_len is None and metadata_trace_len > prompt_len:
+            trace_len = metadata_trace_len
+            max_new_tokens = _resolve_fallback_max_new_tokens(prompt_len, self.args.max_new_tokens, trace_len)
+        elif self.trace_len is None:
+            trace_len = prompt_len + self.args.max_new_tokens
+            max_new_tokens = self.args.max_new_tokens
+        else:
+            trace_len = self.trace_len
+            max_new_tokens = _resolve_fallback_max_new_tokens(prompt_len, self.args.max_new_tokens, trace_len)
 
         tokens = np.full(
             (1, trace_len),
@@ -240,12 +261,14 @@ class OpenVINOGenerator:
         cache = self._empty_cache(np)
         logits = None
         processed_tokens = 0
+        position_dtype = self.input_dtypes.get("cache_position", input_dtype)
         for token_id in input_ids[0].tolist():
             processed_tokens += 1
             result = self.compiled(
                 {
                     "input_ids": np.array([[token_id]], dtype=input_dtype),
                     "attention_mask": self._kv_attention_mask(np, context_len, processed_tokens, mask_dtype),
+                    "cache_position": np.array([processed_tokens - 1], dtype=position_dtype),
                     **cache,
                 }
             )
@@ -275,6 +298,7 @@ class OpenVINOGenerator:
                 {
                     "input_ids": np.array([[next_id]], dtype=input_dtype),
                     "attention_mask": self._kv_attention_mask(np, context_len, processed_tokens, mask_dtype),
+                    "cache_position": np.array([processed_tokens - 1], dtype=position_dtype),
                     **cache,
                 }
             )

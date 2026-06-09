@@ -241,6 +241,7 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
             mixer: nn.Module,
             hidden_states: torch.Tensor,
             attention_mask: torch.Tensor,
+            cache_position: torch.Tensor,
             past_key: torch.Tensor,
             past_value: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -262,11 +263,16 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
             value_states = torch.cat((past_value, value_states), dim=-2)
 
             kv_seq_len = key_states.shape[-2]
-            position_ids = torch.arange(kv_seq_len, dtype=torch.long, device=hidden_states.device)[None]
-            q_position_ids = position_ids[:, -query_states.shape[2] :]
-            cos, sin = mixer.rotary_emb(value_states, seq_len=kv_seq_len)
+            position_ids = (
+                torch.arange(kv_seq_len, dtype=torch.long, device=hidden_states.device)
+                + cache_position[-1].to(torch.long)
+                - kv_seq_len
+                + 1
+            ).clamp(0, mixer.config.max_position_embeddings - 1)[None]
+            q_position_ids = cache_position.to(torch.long).clamp(0, mixer.config.max_position_embeddings - 1)[None]
+            cos, sin = mixer.rotary_emb(value_states, seq_len=mixer.config.max_position_embeddings)
             query_states = self.rotary_pos_emb(query_states, cos, sin, q_position_ids).to(attn_dtype)
-            key_states = self.rotary_pos_emb(key_states, cos, sin, position_ids).to(attn_dtype)
+            rotated_key_states = self.rotary_pos_emb(key_states, cos, sin, position_ids).to(attn_dtype)
             value_states = value_states.to(attn_dtype)
 
             if attention_mask.dtype != torch.bool:
@@ -277,9 +283,9 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
                 attention_mask = attention_mask[None, None]
             if not mixer.full_attn:
                 m_swa = self.swa_mask(
-                    query_states.shape[2], key_states.shape[2], query_states.device, mixer.config.window_size
+                    query_states.shape[2], rotated_key_states.shape[2], query_states.device, mixer.config.window_size
                 )
-                attention_mask = attention_mask[:, :, -query_states.shape[2] :, -key_states.shape[2] :]
+                attention_mask = attention_mask[:, :, -query_states.shape[2] :, -rotated_key_states.shape[2] :]
                 attention_mask = torch.where(m_swa[None, None], attention_mask, float("-inf"))
 
             bool_mask = torch.logical_not(torch.isneginf(attention_mask))
@@ -287,7 +293,7 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
             attention_mask = torch.where(valid_tokens[..., None], attention_mask, float(0.0))
             attn_output = F.scaled_dot_product_attention(
                 query_states,
-                key_states,
+                rotated_key_states,
                 value_states,
                 attn_mask=attention_mask,
                 enable_gqa=True,
@@ -299,12 +305,17 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
                 value_states = value_states[:, :, -mixer.config.window_size :, :]
             return attn_output, key_states[:, :, -self.past_len :, :], value_states[:, :, -self.past_len :, :]
 
-        def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, *past: torch.Tensor) -> tuple[Any, ...]:
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
+            cache_position: torch.Tensor,
+            *past: torch.Tensor,
+        ) -> tuple[Any, ...]:
             base = self.model.model
             inputs_embeds = base.embed_tokens(input_ids.to(torch.long))
             bsz, seq_len, _ = inputs_embeds.shape
-            past_len = past[0].shape[2]
-            cache_position = torch.arange(past_len, past_len + seq_len, device=inputs_embeds.device)
+            cache_position = cache_position.to(torch.long)
             attention_mask = base._prepare_decoder_attention_mask(
                 attention_mask.to(torch.long),
                 (bsz, seq_len),
@@ -321,6 +332,7 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
                     layer.mixer,
                     hidden_states,
                     attention_mask,
+                    cache_position,
                     past[layer_idx * 2],
                     past[layer_idx * 2 + 1],
                 )
@@ -346,7 +358,7 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
     ).eval()
     model.config.use_cache = bool(args.kv_cache)
 
-    token_dtype = torch.int32 if npu else torch.long
+    token_dtype = torch.int32 if args.kv_cache or npu else torch.long
     if args.kv_cache:
         if args.max_seq_len is None:
             args.max_seq_len = 1024
@@ -354,17 +366,18 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
         encoded = {
             "input_ids": torch.tensor([[tokenizer.bos_token_id or 1]], dtype=token_dtype),
             "attention_mask": torch.tensor([[0] * (args.max_seq_len - 1) + [1]], dtype=token_dtype),
+            "cache_position": torch.tensor([0], dtype=token_dtype),
         }
     else:
         if args.max_seq_len is None:
-            encoded = tokenizer("こんにちは", return_tensors="pt")
-        else:
-            pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
-            encoded = {
-                "input_ids": torch.full((1, args.max_seq_len), pad_id, dtype=token_dtype),
-                "attention_mask": torch.ones((1, args.max_seq_len), dtype=token_dtype),
-            }
-    if npu:
+            args.max_seq_len = 512
+            print("Full-context export requested; using --max-seq-len 512.", file=sys.stderr)
+        pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
+        encoded = {
+            "input_ids": torch.full((1, args.max_seq_len), pad_id, dtype=token_dtype),
+            "attention_mask": torch.ones((1, args.max_seq_len), dtype=token_dtype),
+        }
+    if token_dtype == torch.int32:
         encoded = {name: tensor.to(torch.int32) for name, tensor in encoded.items()}
 
     print("Converting PyTorch model with openvino.convert_model...", file=sys.stderr)
@@ -375,7 +388,7 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
         past_len = int(args.max_seq_len) - 1
         example_past = tuple(torch.zeros((1, kv_heads, past_len, head_dim), dtype=dtype) for _ in range(layers * 2))
         wrapped_model = KVLogits(model, layers, past_len).eval()
-        example_input = (encoded["input_ids"], encoded["attention_mask"], *example_past)
+        example_input = (encoded["input_ids"], encoded["attention_mask"], encoded["cache_position"], *example_past)
     else:
         wrapped_model = LogitsOnly(model).eval()
         example_input = (encoded["input_ids"], encoded["attention_mask"])
@@ -388,6 +401,8 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
 
     ov_model.inputs[0].get_tensor().set_names({"input_ids"})
     ov_model.inputs[1].get_tensor().set_names({"attention_mask"})
+    if args.kv_cache:
+        ov_model.inputs[2].get_tensor().set_names({"cache_position"})
     ov_model.outputs[0].get_tensor().set_names({"logits"})
 
     trace_len = int(encoded["input_ids"].shape[1])
@@ -395,11 +410,12 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
         shapes = {
             "input_ids": ov.PartialShape([1, 1]),
             "attention_mask": ov.PartialShape([1, args.max_seq_len]),
+            "cache_position": ov.PartialShape([1]),
         }
         for layer_idx in range(layers):
             shapes[f"past.{layer_idx}.key"] = ov.PartialShape([1, kv_heads, past_len, head_dim])
             shapes[f"past.{layer_idx}.value"] = ov.PartialShape([1, kv_heads, past_len, head_dim])
-        for idx, input_node in enumerate(ov_model.inputs[2:]):
+        for idx, input_node in enumerate(ov_model.inputs[3:]):
             input_node.get_tensor().set_names({f"past.{idx // 2}.{'key' if idx % 2 == 0 else 'value'}"})
         for idx, output_node in enumerate(ov_model.outputs[1:]):
             output_node.get_tensor().set_names({f"present.{idx // 2}.{'key' if idx % 2 == 0 else 'value'}"})
@@ -432,10 +448,11 @@ def _conversion_info(args: Any, weight_format: str, trace_len: int | None, *, us
         "compression_mode": _compression_mode(weight_format, npu=npu),
         "trace_sequence_length": trace_len,
         "static_shapes": npu,
-        "input_dtype": "int32" if npu else "int64",
+        "input_dtype": "int32" if uses_kv_cache or npu else "int64",
         "uses_kv_cache": uses_kv_cache,
     }
     if uses_kv_cache:
+        info["kv_cache_format_version"] = 3
         info["kv_cache_context_length"] = int(args.max_seq_len)
         info["kv_cache_past_length"] = int(args.max_seq_len) - 1
         config_path = Path(args.output_dir) / "config.json"

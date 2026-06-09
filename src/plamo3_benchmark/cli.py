@@ -63,8 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
     convert_parser.add_argument(
         "--kv-cache",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Export a model with flat past-key-value inputs/outputs for incremental inference.",
+        default=False,
+        help=(
+            "Export a CPU-oriented model with flat past-key-value inputs/outputs for incremental inference. "
+            "Default is no KV-cache because OpenVINO GPU currently repeats tokens with this graph."
+        ),
     )
     convert_parser.add_argument(
         "--force",
