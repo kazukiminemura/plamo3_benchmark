@@ -234,11 +234,11 @@ PLaMo 3 を変換します。
 PLaMo 3 の GQA attention は、変換時だけ K/V heads を明示的に展開して OpenVINO の
 `ScaledDotProductAttention` に渡します。
 
-推論では OpenVINO Core と Hugging Face tokenizer を組み合わせます。既定では
-`--max-seq-len` で変換した full-context IR の固定長の範囲内で生成します。
-CPU 用に KV cache 付き IR を作る場合は、`--kv-cache` と `--force` を付けて再変換してください。
-`prompt length + --max-new-tokens` が固定長を超える場合、生成可能な最大トークン数へ
-自動調整し、stderr に警告を表示します。長い応答が必要な場合は、たとえば次のように
+推論では OpenVINO GenAI の `LLMPipeline` を優先して使います。GenAI 互換ではない
+古い IR の場合だけ、OpenVINO Core と Hugging Face tokenizer を組み合わせた
+direct fallback で生成します。fallback では `--max-seq-len` で変換した full-context IR の
+固定長の範囲内で生成します。CPU 用に KV cache 付き IR を作る場合は、`--kv-cache` と
+`--force` を付けて再変換してください。長い応答が必要な場合は、たとえば次のように
 大きめの `--max-seq-len` で再変換してください。
 
 ```powershell
@@ -250,10 +250,11 @@ uv run plamo3-ov convert --output-dir ov-plamo3-int8 --weight-format int8 --max-
 各生成後、stderr に次の形式でメトリクスを表示します。
 
 ```text
-metrics: FTTT=0.123s, tokens=128, total=4.567s, tokens/sec=28.02
+metrics: model_load=12.326s, FTTT=0.123s, tokens=128, total=4.567s, tokens/sec=28.02
 ```
 
+- `model_load`: GenAI pipeline のロード時間
 - `FTTT`: first token time
 - `tokens`: 生成トークン数
 - `total`: 生成全体の経過時間
-- `tokens/sec`: 1 秒あたりの生成トークン数
+- `tokens/sec`: first token 以降の 1 秒あたりの生成トークン数

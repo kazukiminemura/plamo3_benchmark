@@ -21,9 +21,12 @@ except ImportError as exc:
 def _generation_config(args: Any) -> Any:
     config = ov_genai.GenerationConfig()
     config.max_new_tokens = args.max_new_tokens
-    config.temperature = args.temperature
-    config.top_p = args.top_p
-    config.top_k = args.top_k
+    config.do_sample = args.temperature > 0
+    if config.do_sample:
+        config.temperature = args.temperature
+        config.top_p = args.top_p
+        config.top_k = args.top_k
+    config.echo = not args.skip_prompt
     return config
 
 
@@ -79,12 +82,21 @@ def _format_chat_prompt(messages: list[dict[str, str]], system_prompt: str | Non
     return "\n".join(parts)
 
 
-def _print_generation_metrics(token_count: int, start_time: float, first_token_time: float | None) -> None:
-    total_time = max(time.perf_counter() - start_time, 1e-9)
+def _print_generation_metrics(
+    token_count: int,
+    start_time: float,
+    first_token_time: float | None,
+    *,
+    model_load_seconds: float | None = None,
+) -> None:
+    finished_at = time.perf_counter()
+    total_time = max(finished_at - start_time, 1e-9)
     fttt_text = "n/a" if first_token_time is None else f"{first_token_time - start_time:.3f}s"
-    tokens_per_second = token_count / total_time if token_count else 0.0
+    decode_time = total_time if first_token_time is None else max(finished_at - first_token_time, 1e-9)
+    tokens_per_second = token_count / decode_time if token_count else 0.0
+    load_text = "" if model_load_seconds is None else f"model_load={model_load_seconds:.3f}s, "
     print(
-        f"metrics: FTTT={fttt_text}, tokens={token_count}, total={total_time:.3f}s, "
+        f"metrics: {load_text}FTTT={fttt_text}, tokens={token_count}, total={total_time:.3f}s, "
         f"tokens/sec={tokens_per_second:.2f}",
         file=sys.stderr,
     )
@@ -99,7 +111,9 @@ class OpenVINOGenAIGenerator:
         self.tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, use_fast=False)
         self._check_genai_model_inputs(Path(args.model))
         print(f"Using OpenVINO GenAI inference device: {args.device}", file=sys.stderr)
+        started_at = time.perf_counter()
         self.pipe = ov_genai.LLMPipeline(str(args.model), args.device)
+        self.model_load_seconds = time.perf_counter() - started_at
         self.pipe.set_generation_config(self.config)
 
     @staticmethod
@@ -120,19 +134,9 @@ class OpenVINOGenAIGenerator:
                 f"Re-run `{command}`."
             )
 
-    def _encode(self, prompt: str) -> tuple[Any, int]:
-        encoded = self.tokenizer(prompt, return_tensors="np")
-        input_ids = encoded["input_ids"].astype(np.int64)
-        attention_mask = encoded["attention_mask"].astype(np.int64)
-        return (
-            ov_genai.TokenizedInputs(
-                ov.Tensor(input_ids),
-                ov.Tensor(attention_mask),
-            ),
-            int(input_ids.shape[1]),
-        )
-
-    def _decode_result(self, result: Any, prompt_len: int) -> str:
+    def _decode_result(self, result: Any) -> str:
+        if isinstance(result, str):
+            return result
         if hasattr(result, "texts"):
             return "".join(result.texts)
 
@@ -142,31 +146,41 @@ class OpenVINOGenAIGenerator:
             token_array = token_array[0]
 
         token_ids = token_array.astype(np.int64).tolist()
-        if len(token_ids) > prompt_len:
-            token_ids = token_ids[prompt_len:]
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
 
+    def _count_output_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        try:
+            encoded = self.pipe.get_tokenizer().encode(text)
+            return int(encoded.input_ids.shape[-1])
+        except Exception:
+            return len(self.tokenizer.encode(text, add_special_tokens=False))
+
     def generate(self, prompt: str, *, print_output: bool) -> str:
-        inputs, prompt_len = self._encode(prompt)
+        first_token_time: float | None = None
+
+        def streamer(token: str) -> bool:
+            nonlocal first_token_time
+            if first_token_time is None:
+                first_token_time = time.perf_counter()
+            if self.args.stream and print_output:
+                print(token, end="", flush=True)
+            return False
+
+        start_time = time.perf_counter()
+        result = self.pipe.generate(prompt, self.config, streamer)
+        text = self._decode_result(result)
         if self.args.stream and print_output:
-            chunks: list[str] = []
-
-            def streamer(token: Any) -> bool:
-                if isinstance(token, str):
-                    text = token
-                else:
-                    text = self.tokenizer.decode([int(token)], skip_special_tokens=True)
-                chunks.append(text)
-                print(text, end="", flush=True)
-                return False
-
-            result = self.pipe.generate(inputs, self.config, streamer)
             print()
-            return "".join(chunks) if chunks else self._decode_result(result, prompt_len)
-
-        text = self._decode_result(self.pipe.generate(inputs, self.config), prompt_len)
-        if print_output:
+        elif print_output:
             print(text)
+        _print_generation_metrics(
+            self._count_output_tokens(text),
+            start_time,
+            first_token_time,
+            model_load_seconds=self.model_load_seconds,
+        )
         return text
 
     def start_chat(self, system_message: str = "") -> None:
