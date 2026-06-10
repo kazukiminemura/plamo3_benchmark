@@ -201,7 +201,8 @@ Get-Content prompt.txt | uv run plamo3-ov generate --stdin --model ov-plamo3
 - `--stream` / `--no-stream`
 - `--skip-prompt` / `--no-skip-prompt`
 
-`--temperature 0` を指定すると greedy decoding になります。
+OpenVINO GenAI 経路は `gemma4_demo.py` と同じく greedy decoding で生成します。
+`--temperature` / `--top-p` / `--top-k` / `--stream` は direct fallback でのみ使います。
 
 ## チャット
 
@@ -250,11 +251,10 @@ uv run plamo3-ov convert --output-dir ov-plamo3-int8 --weight-format int8 --max-
 各生成後、stderr に次の形式でメトリクスを表示します。
 
 ```text
-metrics: model_load=12.326s, FTTT=0.123s, tokens=128, total=4.567s, tokens/sec=28.02
+[metrics] model_load: 12.326s | time_to_first_token: 0.123s | output_tokens: 128 | tokens/sec: 28.02
 ```
 
 - `model_load`: GenAI pipeline のロード時間
-- `FTTT`: first token time
-- `tokens`: 生成トークン数
-- `total`: 生成全体の経過時間
+- `time_to_first_token`: first token time
+- `output_tokens`: 生成トークン数
 - `tokens/sec`: first token 以降の 1 秒あたりの生成トークン数
