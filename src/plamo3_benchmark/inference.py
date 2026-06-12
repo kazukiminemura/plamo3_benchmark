@@ -162,7 +162,7 @@ class OpenVINOGenAIGenerator:
             prompt,
             max_new_tokens=self.args.max_new_tokens,
             do_sample=False,
-            apply_chat_template=not self.in_chat,
+            apply_chat_template=not self.in_chat and bool(getattr(self.args, "apply_chat_template", False)),
             streamer=streamer,
         )
         finished_at = time.perf_counter()
@@ -198,18 +198,20 @@ class DirectOpenVINOGenerator:
         core = ov.Core()
         model = core.read_model(self.model_dir / "openvino_model.xml")
         self.input_names = {item.get_any_name(): item for item in model.inputs}
+        self.stateful = "position_ids" in self.input_names and bool(getattr(model, "get_variables", list)())
         self.output = model.output(0)
         output_shape = list(model.output(0).get_partial_shape())
         self.trace_len = output_shape[1].get_length() if len(output_shape) > 1 and output_shape[1].is_static else None
         if self.trace_len is None:
             input_shape = list(self.input_names["input_ids"].get_partial_shape())
             self.trace_len = input_shape[1].get_length() if len(input_shape) > 1 and input_shape[1].is_static else None
-        if self.trace_len is None:
+        if self.trace_len is None and not self.stateful:
             self.trace_len = int(self._read_info().get("trace_sequence_length") or 512)
 
         print(f"Using direct OpenVINO inference device: {args.device}", file=sys.stderr)
         self.compiled = core.compile_model(model, args.device)
         self.compiled_output = self.compiled.output(0)
+        self.request = self.compiled.create_infer_request() if self.stateful else None
 
     def _read_info(self) -> dict[str, Any]:
         try:
@@ -217,7 +219,50 @@ class DirectOpenVINOGenerator:
         except Exception:
             return {}
 
+    def _infer_stateful(self, token_ids: list[int], start_position: int, total_len: int) -> Any:
+        inputs = {
+            "input_ids": np.array([token_ids], dtype=np.int64),
+            "attention_mask": np.ones((1, total_len), dtype=np.int64),
+            "position_ids": np.arange(start_position, start_position + len(token_ids), dtype=np.int64)[None],
+            "beam_idx": np.array([0], dtype=np.int32),
+        }
+        self.request.infer(inputs)
+        return self.request.get_output_tensor(0).data
+
+    def _generate_stateful(self, prompt: str, *, print_output: bool) -> str:
+        input_ids = self.tokenizer(prompt, return_tensors="np")["input_ids"].astype(np.int64)
+        prompt_ids = [int(token) for token in input_ids[0]]
+        generated: list[int] = []
+        eos_ids = {self.tokenizer.eos_token_id} if self.tokenizer.eos_token_id is not None else set()
+        start_time = time.perf_counter()
+        first_token_time: float | None = None
+
+        self.request.reset_state()
+        logits = self._infer_stateful(prompt_ids, 0, len(prompt_ids))[0, -1]
+        position = len(prompt_ids)
+        for _ in range(self.args.max_new_tokens):
+            next_id = _sample_next_token(logits, self.args)
+            if next_id in eos_ids:
+                break
+            if first_token_time is None:
+                first_token_time = time.perf_counter()
+            generated.append(next_id)
+            if self.args.stream and print_output:
+                print(self.tokenizer.decode([next_id], skip_special_tokens=True), end="", flush=True)
+            logits = self._infer_stateful([next_id], position, position + 1)[0, -1]
+            position += 1
+
+        text = self.tokenizer.decode(generated, skip_special_tokens=True)
+        if self.args.stream and print_output:
+            print()
+        elif print_output:
+            print(text)
+        _print_generation_metrics(None, len(generated), start_time, first_token_time, finished_at=time.perf_counter())
+        return text
+
     def generate(self, prompt: str, *, print_output: bool) -> str:
+        if self.stateful:
+            return self._generate_stateful(prompt, print_output=print_output)
         encoded = self.tokenizer(prompt, return_tensors="np")
         input_ids = encoded["input_ids"].astype(np.int64)
         attention_mask = encoded["attention_mask"].astype(np.int64)

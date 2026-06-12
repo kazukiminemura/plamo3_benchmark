@@ -8,7 +8,7 @@ DEFAULT_MODEL_ID = "pfnet/plamo-3-nict-8b-base"
 
 
 def configure_output_encoding() -> None:
-    for stream in (sys.stdout, sys.stderr):
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
             try:

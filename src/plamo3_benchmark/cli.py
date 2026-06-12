@@ -22,6 +22,16 @@ def _add_generation_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--stream", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--skip-prompt", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--apply-chat-template",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Wrap the prompt with the model chat template before generation. Default off: "
+            "PLaMo 3 NICT 8B Base is a base model, and raw continuation matches it better. "
+            "The chat command always uses the chat template."
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -63,10 +73,11 @@ def build_parser() -> argparse.ArgumentParser:
     convert_parser.add_argument(
         "--kv-cache",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
-            "Export a CPU-oriented model with flat past-key-value inputs/outputs for incremental inference. "
-            "Default is no KV-cache because OpenVINO GPU currently repeats tokens with this graph."
+            "Export a stateful KV-cache model compatible with OpenVINO GenAI incremental "
+            "inference (default). Use --no-kv-cache for a full-context model that recomputes "
+            "the whole prompt every step. NPU targets always use --no-kv-cache."
         ),
     )
     convert_parser.add_argument(

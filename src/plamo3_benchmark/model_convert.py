@@ -89,6 +89,87 @@ def _compress_weights(ov_model: Any, weight_format: str, *, npu: bool) -> Any:
     return compress_weights(ov_model, mode=mode, advanced_parameters=advanced_parameters, **kwargs)
 
 
+def _build_fast_unigram_tokenizer(tokenizer: Any) -> Any:
+    """Rebuild Plamo3Tokenizer as a Hugging Face fast Unigram tokenizer.
+
+    openvino_tokenizers cannot convert the custom Plamo3Tokenizer class, but its
+    vocabulary (`tokenizer.jsonl`) is a plain Unigram model with byte fallback, so an
+    equivalent fast tokenizer converts cleanly. Known differences: the
+    `break_around_repeated_chars_threshold` segmentation heuristic is not reproduced
+    (the decoded text is still identical), and the detokenizer drops one leading space
+    when the decoded sequence starts with two or more spaces.
+    """
+    import math
+
+    from tokenizers import AddedToken, Regex, Tokenizer, decoders, pre_tokenizers
+    from tokenizers.models import Unigram
+    from transformers import PreTrainedTokenizerFast
+
+    data = getattr(tokenizer, "data", None)
+    if not data:
+        raise ValueError("tokenizer does not expose a Unigram vocabulary (`data` attribute)")
+
+    def quantize(value: Any) -> float:
+        # Plamo3Tokenizer quantizes scores with round(score * 1e4) when building its
+        # trie; mirroring that keeps Viterbi segmentation identical.
+        score = float(value)
+        return round(score * 1e4) / 1e4 if math.isfinite(score) else score
+
+    vocab = [(str(row[0]), quantize(row[1])) for row in data]
+    unk_ids = [idx for idx, row in enumerate(data) if len(row) > 2 and row[2] == "UNKNOWN"]
+    fast_core = Tokenizer(Unigram(vocab, unk_id=unk_ids[0] if unk_ids else 0, byte_fallback=True))
+    spaces_threshold = getattr(tokenizer, "break_around_consecutive_spaces_threshold", None)
+    if spaces_threshold:
+        fast_core.pre_tokenizer = pre_tokenizers.Split(
+            Regex(f" {{{int(spaces_threshold)},}}"), behavior="isolated"
+        )
+    fast_core.decoder = decoders.Sequence([decoders.ByteFallback(), decoders.Fuse()])
+    fast_core.add_special_tokens(
+        [
+            AddedToken(str(row[0]), special=True, normalized=False)
+            for row in data
+            if len(row) > 2 and row[2] == "CONTROL"
+        ]
+    )
+    bos_token = str(tokenizer.bos_token)
+    if getattr(tokenizer, "add_bos_token", False) and tokenizer.bos_token_id is not None:
+        # processors.TemplateProcessing cannot be built directly because it parses the
+        # ":" inside "<|plamo:bos|>" as a type_id separator, so inject the processor
+        # through the serialized tokenizer state instead.
+        bos_piece = {"SpecialToken": {"id": bos_token, "type_id": 0}}
+        state = json.loads(fast_core.to_str())
+        state["post_processor"] = {
+            "type": "TemplateProcessing",
+            "single": [bos_piece, {"Sequence": {"id": "A", "type_id": 0}}],
+            "pair": [
+                bos_piece,
+                {"Sequence": {"id": "A", "type_id": 0}},
+                {"SpecialToken": {"id": bos_token, "type_id": 1}},
+                {"Sequence": {"id": "B", "type_id": 1}},
+            ],
+            "special_tokens": {
+                bos_token: {"id": bos_token, "ids": [int(tokenizer.bos_token_id)], "tokens": [bos_token]},
+            },
+        }
+        fast_core = Tokenizer.from_str(json.dumps(state))
+    return PreTrainedTokenizerFast(
+        tokenizer_object=fast_core,
+        unk_token=str(tokenizer.unk_token),
+        bos_token=bos_token,
+        eos_token=str(tokenizer.eos_token),
+        pad_token=str(tokenizer.pad_token),
+        clean_up_tokenization_spaces=False,
+    )
+
+
+def _convert_tokenizer_to_ir(tokenizer: Any) -> tuple[Any, Any]:
+    try:
+        return convert_tokenizer(tokenizer, with_detokenizer=True)
+    except Exception:
+        fast_tokenizer = _build_fast_unigram_tokenizer(tokenizer)
+        return convert_tokenizer(fast_tokenizer, with_detokenizer=True, clean_up_tokenization_spaces=False)
+
+
 def _write_json_if_present(model: str, output_dir: Path, filename: str, *, local_files_only: bool) -> None:
     if is_local_model_path(model):
         source = Path(model) / filename
@@ -118,7 +199,7 @@ def _save_tokenizer_and_configs(ov: Any, tokenizer: Any, args: Any, output_dir: 
             path.unlink()
     tokenizer.save_pretrained(output_dir)
     try:
-        ov_tokenizer, ov_detokenizer = convert_tokenizer(tokenizer, with_detokenizer=True)
+        ov_tokenizer, ov_detokenizer = _convert_tokenizer_to_ir(tokenizer)
         ov.save_model(ov_tokenizer, output_dir / "openvino_tokenizer.xml")
         ov.save_model(ov_detokenizer, output_dir / "openvino_detokenizer.xml")
     except Exception as exc:
@@ -167,6 +248,9 @@ def convert(args: Any) -> int:
     check_hugging_face_access(args.model, local_files_only=args.local_files_only)
 
     npu = _is_npu(args.target_device)
+    if npu and args.kv_cache:
+        args.kv_cache = False
+        print("NPU target requested; exporting a static full-context model without KV cache.", file=sys.stderr)
     if npu and args.max_seq_len is None:
         args.max_seq_len = 512
         print("NPU target requested; using --max-seq-len 512.", file=sys.stderr)
@@ -200,8 +284,10 @@ def _update_existing(args: Any, output_dir: Path, xml_path: Path, tokenizer: Any
     uses_kv_cache = bool(info.get("uses_kv_cache", False))
     if args.kv_cache != uses_kv_cache:
         die("Existing model KV-cache setting differs from --kv-cache; re-run with `--force`.")
+    if uses_kv_cache and info.get("kv_cache_format_version") != 4:
+        die("Existing KV-cache model uses the old non-stateful layout; re-run convert with `--force`.")
     input_names = {item.get_any_name() for item in ov.Core().read_model(xml_path).inputs}
-    if not uses_kv_cache and "beam_idx" not in input_names:
+    if "beam_idx" not in input_names:
         die("Existing model is missing the GenAI `beam_idx` input; re-run convert with `--force`.")
     if not uses_kv_cache and args.max_seq_len is not None and trace_len is not None and int(args.max_seq_len) != trace_len:
         die(
@@ -247,22 +333,29 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
             )[0]
             return logits + beam_idx.to(logits.dtype).reshape(-1, 1, 1) * 0
 
-    class KVLogits(nn.Module):
-        def __init__(self, model: nn.Module, layers: int, past_len: int) -> None:
+    class StatefulKV(nn.Module):
+        """PLaMo3 decoder with flat KV-cache inputs/outputs and GenAI-style inputs.
+
+        Inputs: input_ids [1, seq], attention_mask [1, past+seq] (consumed shape-free;
+        batch-1 generation has no padding), position_ids [1, seq], beam_idx [1] and
+        past.* [1, kv_heads, past_len, head_dim]. Attention masks are built purely from
+        position tensors so torch.export does not create guards coupling the dynamic
+        dimensions, and the sliding window is enforced by masking instead of clipping
+        the cache (the cache grows to max_position_embeddings at most).
+        """
+
+        def __init__(self, model: nn.Module) -> None:
             super().__init__()
             self.model = model
-            self.layers = layers
-            self.past_len = past_len
-            module = __import__(model.__class__.__module__, fromlist=["_rotary_pos_emb", "swa_mask"])
+            module = __import__(model.__class__.__module__, fromlist=["_rotary_pos_emb"])
             self.rotary_pos_emb = module._rotary_pos_emb
-            self.swa_mask = module.swa_mask
+            self.window = int(model.config.window_size)
 
         def attention(
             self,
             mixer: nn.Module,
             hidden_states: torch.Tensor,
-            attention_mask: torch.Tensor,
-            cache_position: torch.Tensor,
+            position_ids: torch.Tensor,
             past_key: torch.Tensor,
             past_value: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -283,86 +376,67 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
             key_states = torch.cat((past_key, key_states), dim=-2)
             value_states = torch.cat((past_value, value_states), dim=-2)
 
-            kv_seq_len = key_states.shape[-2]
-            position_ids = (
-                torch.arange(kv_seq_len, dtype=torch.long, device=hidden_states.device)
-                + cache_position[-1].to(torch.long)
-                - kv_seq_len
+            kv_len = key_states.shape[-2]
+            max_pos = mixer.config.max_position_embeddings
+            q_pos = position_ids.to(torch.long)  # [1, q_len]
+            k_pos = (
+                torch.arange(kv_len, dtype=torch.long, device=hidden_states.device)
+                + q_pos[:, -1:]
+                - kv_len
                 + 1
-            ).clamp(0, mixer.config.max_position_embeddings - 1)[None]
-            q_position_ids = cache_position.to(torch.long).clamp(0, mixer.config.max_position_embeddings - 1)[None]
-            cos, sin = mixer.rotary_emb(value_states, seq_len=mixer.config.max_position_embeddings)
-            query_states = self.rotary_pos_emb(query_states, cos, sin, q_position_ids).to(attn_dtype)
-            rotated_key_states = self.rotary_pos_emb(key_states, cos, sin, position_ids).to(attn_dtype)
+            )  # [1, kv_len]
+
+            cos, sin = mixer.rotary_emb(value_states, seq_len=max_pos)
+            query_states = self.rotary_pos_emb(query_states, cos, sin, q_pos.clamp(0, max_pos - 1)).to(attn_dtype)
+            rotated_key_states = self.rotary_pos_emb(key_states, cos, sin, k_pos.clamp(0, max_pos - 1)).to(attn_dtype)
             value_states = value_states.to(attn_dtype)
 
-            if attention_mask.dtype != torch.bool:
-                attention_mask = attention_mask.to(attn_dtype)
-            if attention_mask.dtype == torch.bool:
-                attention_mask = torch.where(attention_mask, torch.tensor(0.0, dtype=torch.float), float("-inf"))
-            if len(attention_mask.shape) == 2:
-                attention_mask = attention_mask[None, None]
+            visible = k_pos[:, None, :] <= q_pos[:, :, None]  # causal, [1, q_len, kv_len]
             if not mixer.full_attn:
-                m_swa = self.swa_mask(
-                    query_states.shape[2], rotated_key_states.shape[2], query_states.device, mixer.config.window_size
-                )
-                attention_mask = attention_mask[:, :, -query_states.shape[2] :, -rotated_key_states.shape[2] :]
-                attention_mask = torch.where(m_swa[None, None], attention_mask, float("-inf"))
+                visible = visible & (k_pos[:, None, :] > q_pos[:, :, None] - self.window)
+            attn_mask = torch.where(visible, 0.0, float("-inf")).to(attn_dtype)[:, None]
 
-            bool_mask = torch.logical_not(torch.isneginf(attention_mask))
-            valid_tokens = torch.sum(bool_mask, dim=-1).bool()
-            attention_mask = torch.where(valid_tokens[..., None], attention_mask, float(0.0))
             attn_output = F.scaled_dot_product_attention(
                 query_states,
                 rotated_key_states,
                 value_states,
-                attn_mask=attention_mask,
+                attn_mask=attn_mask,
                 enable_gqa=True,
             )
             attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, mixer.q_num_heads * mixer.v_dim)
             attn_output = mixer.o_proj(attn_output)
-            if not mixer.full_attn:
-                key_states = key_states[:, :, -mixer.config.window_size :, :]
-                value_states = value_states[:, :, -mixer.config.window_size :, :]
-            return attn_output, key_states[:, :, -self.past_len :, :], value_states[:, :, -self.past_len :, :]
+            return attn_output, key_states, value_states
 
         def forward(
             self,
             input_ids: torch.Tensor,
             attention_mask: torch.Tensor,
-            cache_position: torch.Tensor,
+            position_ids: torch.Tensor,
+            beam_idx: torch.Tensor,
             *past: torch.Tensor,
         ) -> tuple[Any, ...]:
             base = self.model.model
             inputs_embeds = base.embed_tokens(input_ids.to(torch.long))
-            bsz, seq_len, _ = inputs_embeds.shape
-            cache_position = cache_position.to(torch.long)
-            attention_mask = base._prepare_decoder_attention_mask(
-                attention_mask.to(torch.long),
-                (bsz, seq_len),
-                inputs_embeds,
-                cache_position,
-            )
-
             hidden_states = inputs_embeds
+            beam = beam_idx.to(torch.long)
             flat_cache = []
             for layer_idx, layer in enumerate(base.layers.layers):
+                past_key = past[layer_idx * 2].index_select(0, beam)
+                past_value = past[layer_idx * 2 + 1].index_select(0, beam)
                 residual = hidden_states
                 hidden_states = layer.pre_mixer_norm(hidden_states)
                 attn_out, key, value = self.attention(
-                    layer.mixer,
-                    hidden_states,
-                    attention_mask,
-                    cache_position,
-                    past[layer_idx * 2],
-                    past[layer_idx * 2 + 1],
+                    layer.mixer, hidden_states, position_ids, past_key, past_value
                 )
                 hidden_states = residual + layer.post_mixer_norm(attn_out)
                 residual = hidden_states
                 hidden_states = residual + layer.post_mlp_norm(layer.mlp(layer.pre_mlp_norm(hidden_states)))
                 flat_cache.extend([key, value])
 
-            logits = self.model.lm_head(base.norm(hidden_states))
+            # GenAI reads logits as f32 regardless of the traced precision.
+            logits = self.model.lm_head(base.norm(hidden_states)).to(torch.float32)
+            # Consume attention_mask without coupling its length to other dims.
+            logits = logits + attention_mask.to(logits.dtype).sum() * 0
             return (logits, *flat_cache)
 
     weight_format = _weight_format(args)
@@ -377,85 +451,100 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
         low_cpu_mem_usage=True,
         local_files_only=args.local_files_only,
     ).eval()
-    model.config.use_cache = bool(args.kv_cache)
+    model.config.use_cache = False
 
-    token_dtype = torch.int32 if args.kv_cache or npu else torch.long
+    print("Converting PyTorch model with openvino.convert_model...", file=sys.stderr)
     if args.kv_cache:
-        if args.max_seq_len is None:
-            args.max_seq_len = 1024
-            print("KV-cache export requested; using --max-seq-len 1024.", file=sys.stderr)
-        encoded = {
-            "input_ids": torch.tensor([[tokenizer.bos_token_id or 1]], dtype=token_dtype),
-            "attention_mask": torch.tensor([[0] * (args.max_seq_len - 1) + [1]], dtype=token_dtype),
-            "cache_position": torch.tensor([0], dtype=token_dtype),
-        }
+        trace_len = None
+        layers = int(getattr(model.config, "num_hidden_layers"))
+        kv_heads = int(getattr(model.config, "num_key_value_heads"))
+        head_dim = int(getattr(model.config, "head_dim"))
+        seq_example, past_example = 8, 16
+        example_input = (
+            torch.ones((1, seq_example), dtype=torch.int64),
+            torch.ones((1, past_example + seq_example), dtype=torch.int64),
+            torch.arange(past_example, past_example + seq_example, dtype=torch.int64)[None],
+            torch.tensor([0], dtype=torch.int32),
+            *(torch.zeros((1, kv_heads, past_example, head_dim), dtype=dtype) for _ in range(layers * 2)),
+        )
+        dynamic_shapes = (
+            {1: torch.export.Dim.DYNAMIC},
+            {1: torch.export.Dim.DYNAMIC},
+            {1: torch.export.Dim.DYNAMIC},
+            {0: torch.export.Dim.STATIC},
+            tuple({2: torch.export.Dim.DYNAMIC} for _ in range(layers * 2)),
+        )
+        with _patch_gqa_attention(torch):
+            exported = torch.export.export(
+                StatefulKV(model).eval(), example_input, dynamic_shapes=dynamic_shapes, strict=False
+            )
+            ov_model = ov.convert_model(exported)
+        del exported
+
+        for node, name in zip(ov_model.inputs[:4], ("input_ids", "attention_mask", "position_ids", "beam_idx")):
+            node.get_tensor().set_names({name})
+        ov_model.outputs[0].get_tensor().set_names({"logits"})
+        state_pairs = {}
+        for idx, node in enumerate(ov_model.inputs[4:]):
+            node.get_tensor().set_names({f"past.{idx // 2}.{'key' if idx % 2 == 0 else 'value'}"})
+        for idx, node in enumerate(ov_model.outputs[1:]):
+            node.get_tensor().set_names({f"present.{idx // 2}.{'key' if idx % 2 == 0 else 'value'}"})
+            state_pairs[f"past.{idx // 2}.{'key' if idx % 2 == 0 else 'value'}"] = (
+                f"present.{idx // 2}.{'key' if idx % 2 == 0 else 'value'}"
+            )
+
+        # Pin head count / head size of the cache inputs so the initial (empty) state
+        # created by ReadValue has shape [1, kv_heads, 0, head_dim] and concatenates
+        # cleanly with the new keys/values.
+        ov_model.reshape(
+            {
+                node.get_any_name(): ov.PartialShape([1, kv_heads, -1, head_dim])
+                for node in ov_model.inputs
+                if node.get_any_name().startswith("past.")
+            }
+        )
+
+        from openvino._offline_transformations import apply_make_stateful_transformation
+
+        apply_make_stateful_transformation(ov_model, state_pairs)
     else:
         if args.max_seq_len is None:
             args.max_seq_len = 512
             print("Full-context export requested; using --max-seq-len 512.", file=sys.stderr)
+        token_dtype = torch.int32 if npu else torch.long
         pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
-        encoded = {
-            "input_ids": torch.full((1, args.max_seq_len), pad_id, dtype=token_dtype),
-            "attention_mask": torch.ones((1, args.max_seq_len), dtype=token_dtype),
-            "beam_idx": torch.tensor([0], dtype=torch.int32),
-        }
-    if token_dtype == torch.int32:
-        encoded = {name: tensor.to(torch.int32) for name, tensor in encoded.items()}
-
-    print("Converting PyTorch model with openvino.convert_model...", file=sys.stderr)
-    if args.kv_cache:
-        layers = int(getattr(model.config, "num_hidden_layers"))
-        kv_heads = int(getattr(model.config, "num_key_value_heads"))
-        head_dim = int(getattr(model.config, "head_dim"))
-        past_len = int(args.max_seq_len) - 1
-        example_past = tuple(torch.zeros((1, kv_heads, past_len, head_dim), dtype=dtype) for _ in range(layers * 2))
-        wrapped_model = KVLogits(model, layers, past_len).eval()
-        example_input = (encoded["input_ids"], encoded["attention_mask"], encoded["cache_position"], *example_past)
-    else:
-        wrapped_model = LogitsOnly(model).eval()
-        example_input = (encoded["input_ids"], encoded["attention_mask"], encoded["beam_idx"])
-    with _patch_gqa_attention(torch):
-        ov_model = ov.convert_model(
-            wrapped_model,
-            example_input=example_input,
-            dynamo=True,
+        example_input = (
+            torch.full((1, args.max_seq_len), pad_id, dtype=token_dtype),
+            torch.ones((1, args.max_seq_len), dtype=token_dtype),
+            torch.tensor([0], dtype=torch.int32),
         )
+        trace_len = int(args.max_seq_len)
+        with _patch_gqa_attention(torch):
+            ov_model = ov.convert_model(
+                LogitsOnly(model).eval(),
+                example_input=example_input,
+                dynamo=True,
+            )
 
-    ov_model.inputs[0].get_tensor().set_names({"input_ids"})
-    ov_model.inputs[1].get_tensor().set_names({"attention_mask"})
-    if args.kv_cache:
-        ov_model.inputs[2].get_tensor().set_names({"cache_position"})
-    else:
+        ov_model.inputs[0].get_tensor().set_names({"input_ids"})
+        ov_model.inputs[1].get_tensor().set_names({"attention_mask"})
         ov_model.inputs[2].get_tensor().set_names({"beam_idx"})
-    ov_model.outputs[0].get_tensor().set_names({"logits"})
+        ov_model.outputs[0].get_tensor().set_names({"logits"})
 
-    trace_len = int(encoded["input_ids"].shape[1])
-    if args.kv_cache:
-        shapes = {
-            "input_ids": ov.PartialShape([1, 1]),
-            "attention_mask": ov.PartialShape([1, args.max_seq_len]),
-            "cache_position": ov.PartialShape([1]),
-        }
-        for layer_idx in range(layers):
-            shapes[f"past.{layer_idx}.key"] = ov.PartialShape([1, kv_heads, past_len, head_dim])
-            shapes[f"past.{layer_idx}.value"] = ov.PartialShape([1, kv_heads, past_len, head_dim])
-        for idx, input_node in enumerate(ov_model.inputs[3:]):
-            input_node.get_tensor().set_names({f"past.{idx // 2}.{'key' if idx % 2 == 0 else 'value'}"})
-        for idx, output_node in enumerate(ov_model.outputs[1:]):
-            output_node.get_tensor().set_names({f"present.{idx // 2}.{'key' if idx % 2 == 0 else 'value'}"})
-    else:
         shapes = {
             "input_ids": ov.PartialShape([1, trace_len] if npu else [-1, -1]),
             "attention_mask": ov.PartialShape([1, trace_len] if npu else [-1, -1]),
             "beam_idx": ov.PartialShape([1] if npu else [-1]),
         }
-    try:
-        ov_model.reshape(shapes)
-    except Exception:
-        if npu:
-            raise
-        print("warning: converted model kept the traced prompt shape.", file=sys.stderr)
+        try:
+            ov_model.reshape(shapes)
+        except Exception:
+            if npu:
+                raise
+            print("warning: converted model kept the traced prompt shape.", file=sys.stderr)
 
+    del model
+    gc.collect()
     ov_model = _compress_weights(ov_model, weight_format, npu=npu)
     _save_model(ov, ov_model, output_dir / "openvino_model.xml", fp16=weight_format == "fp16")
     _save_tokenizer_and_configs(ov, tokenizer, args, output_dir)
@@ -473,13 +562,12 @@ def _conversion_info(args: Any, weight_format: str, trace_len: int | None, *, us
         "compression_mode": _compression_mode(weight_format, npu=npu),
         "trace_sequence_length": trace_len,
         "static_shapes": npu,
-        "input_dtype": "int32" if uses_kv_cache or npu else "int64",
+        "input_dtype": "int32" if npu else "int64",
         "uses_kv_cache": uses_kv_cache,
     }
     if uses_kv_cache:
-        info["kv_cache_format_version"] = 3
-        info["kv_cache_context_length"] = int(args.max_seq_len)
-        info["kv_cache_past_length"] = int(args.max_seq_len) - 1
+        info["kv_cache_format_version"] = 4
+        info["stateful"] = True
         config_path = Path(args.output_dir) / "config.json"
         try:
             config = json.loads(config_path.read_text(encoding="utf-8"))
