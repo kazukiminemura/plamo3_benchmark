@@ -258,12 +258,7 @@ def convert(args: Any) -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     check_hugging_face_access(args.model, local_files_only=args.local_files_only)
-
-    npu = _is_npu(args.target_device)
-    if npu and args.kv_cache:
-        args.kv_cache = False
-        print("NPU target requested; exporting a static full-context model without KV cache.", file=sys.stderr)
-    if npu and args.max_seq_len is None:
+    if _is_npu(args.target_device) and args.max_seq_len is None:
         args.max_seq_len = 512
         print("NPU target requested; using --max-seq-len 512.", file=sys.stderr)
 
@@ -291,28 +286,29 @@ def _update_existing(args: Any, output_dir: Path, xml_path: Path, tokenizer: Any
     print(f"Reusing existing OpenVINO model: {xml_path}", file=sys.stderr)
     info = _read_info(output_dir)
     weight_format = _weight_format(args)
-    trace_len = _trace_len(ov, xml_path)
+    npu = _is_npu(args.target_device)
 
-    uses_kv_cache = bool(info.get("uses_kv_cache", False))
-    if args.kv_cache != uses_kv_cache:
-        die("Existing model KV-cache setting differs from --kv-cache; re-run with `--force`.")
-    if uses_kv_cache and info.get("kv_cache_format_version") != 4:
-        die("Existing KV-cache model uses the old non-stateful layout; re-run convert with `--force`.")
-    input_names = {item.get_any_name() for item in ov.Core().read_model(xml_path).inputs}
-    if "beam_idx" not in input_names:
-        die("Existing model is missing the GenAI `beam_idx` input; re-run convert with `--force`.")
-    if not uses_kv_cache and args.max_seq_len is not None and trace_len is not None and int(args.max_seq_len) != trace_len:
-        die(
-            f"openvino_model.xml already exists with traced sequence length {trace_len}, "
-            f"but --max-seq-len {args.max_seq_len} was requested. Re-run with `--force`."
-        )
+    model = ov.Core().read_model(xml_path)
+    input_names = {item.get_any_name() for item in model.inputs}
+    stateful = "beam_idx" in input_names and bool(getattr(model, "get_variables", list)())
+    if npu:
+        trace_len = _trace_len(ov, xml_path)
+        if info.get("static_shapes") is not True or info.get("input_dtype") != "int32":
+            die("Existing model is not NPU static-shape/int32 IR; re-run convert with `--force`.")
+        if args.max_seq_len is not None and trace_len is not None and int(args.max_seq_len) != trace_len:
+            die(
+                f"openvino_model.xml already exists with traced sequence length {trace_len}, "
+                f"but --max-seq-len {args.max_seq_len} was requested. Re-run with `--force`."
+            )
+    elif not stateful:
+        die("Existing model is not stateful GenAI IR; re-run convert with `--force`.")
+    if stateful and info.get("kv_cache_format_version") != 4:
+        die("Existing stateful model uses an old KV-cache layout; re-run convert with `--force`.")
     if info.get("weight_format") and info.get("weight_format") != weight_format:
         die(f"Existing model is {info['weight_format']}; re-run with `--force` to save {weight_format}.")
-    if _is_npu(args.target_device) and (info.get("static_shapes") is not True or info.get("input_dtype") != "int32"):
-        die("Existing model is not NPU static-shape/int32 IR; re-run with `--force`.")
 
     _save_tokenizer_and_configs(ov, tokenizer, args, output_dir)
-    _write_info(output_dir, _conversion_info(args, weight_format, trace_len, uses_kv_cache=uses_kv_cache))
+    _write_info(output_dir, _conversion_info(args, weight_format, trace_len=_trace_len(ov, xml_path)))
     print(f"Updated existing OpenVINO model directory: {output_dir}", file=sys.stderr)
     return 0
 
@@ -331,12 +327,7 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
             super().__init__()
             self.model = model
 
-        def forward(
-            self,
-            input_ids: torch.Tensor,
-            attention_mask: torch.Tensor,
-            beam_idx: torch.Tensor,
-        ) -> torch.Tensor:
+        def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, beam_idx: torch.Tensor) -> Any:
             logits = self.model(
                 input_ids=input_ids.to(torch.long),
                 attention_mask=attention_mask.to(torch.long),
@@ -466,8 +457,27 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
     model.config.use_cache = False
 
     print("Converting PyTorch model with openvino.convert_model...", file=sys.stderr)
-    if args.kv_cache:
-        trace_len = None
+    trace_len = int(args.max_seq_len) if npu else None
+    if npu:
+        pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
+        example_input = (
+            torch.full((1, trace_len), pad_id, dtype=torch.int32),
+            torch.ones((1, trace_len), dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32),
+        )
+        with _patch_gqa_attention(torch):
+            ov_model = ov.convert_model(LogitsOnly(model).eval(), example_input=example_input, dynamo=True)
+        for node, name in zip(ov_model.inputs, ("input_ids", "attention_mask", "beam_idx")):
+            node.get_tensor().set_names({name})
+        ov_model.outputs[0].get_tensor().set_names({"logits"})
+        ov_model.reshape(
+            {
+                "input_ids": ov.PartialShape([1, trace_len]),
+                "attention_mask": ov.PartialShape([1, trace_len]),
+                "beam_idx": ov.PartialShape([1]),
+            }
+        )
+    else:
         layers = int(getattr(model.config, "num_hidden_layers"))
         kv_heads = int(getattr(model.config, "num_key_value_heads"))
         head_dim = int(getattr(model.config, "head_dim"))
@@ -496,18 +506,17 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
         for node, name in zip(ov_model.inputs[:4], ("input_ids", "attention_mask", "position_ids", "beam_idx")):
             node.get_tensor().set_names({name})
         ov_model.outputs[0].get_tensor().set_names({"logits"})
+
+        def cache_name(prefix: str, idx: int) -> str:
+            return f"{prefix}.{idx // 2}.{'key' if idx % 2 == 0 else 'value'}"
+
         state_pairs = {}
         for idx, node in enumerate(ov_model.inputs[4:]):
-            node.get_tensor().set_names({f"past.{idx // 2}.{'key' if idx % 2 == 0 else 'value'}"})
+            node.get_tensor().set_names({cache_name("past", idx)})
         for idx, node in enumerate(ov_model.outputs[1:]):
-            node.get_tensor().set_names({f"present.{idx // 2}.{'key' if idx % 2 == 0 else 'value'}"})
-            state_pairs[f"past.{idx // 2}.{'key' if idx % 2 == 0 else 'value'}"] = (
-                f"present.{idx // 2}.{'key' if idx % 2 == 0 else 'value'}"
-            )
+            node.get_tensor().set_names({cache_name("present", idx)})
+            state_pairs[cache_name("past", idx)] = cache_name("present", idx)
 
-        # Pin head count / head size of the cache inputs so the initial (empty) state
-        # created by ReadValue has shape [1, kv_heads, 0, head_dim] and concatenates
-        # cleanly with the new keys/values.
         ov_model.reshape(
             {
                 node.get_any_name(): ov.PartialShape([1, kv_heads, -1, head_dim])
@@ -519,53 +528,18 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any) -> int:
         from openvino._offline_transformations import apply_make_stateful_transformation
 
         apply_make_stateful_transformation(ov_model, state_pairs)
-    else:
-        if args.max_seq_len is None:
-            args.max_seq_len = 512
-            print("Full-context export requested; using --max-seq-len 512.", file=sys.stderr)
-        token_dtype = torch.int32 if npu else torch.long
-        pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
-        example_input = (
-            torch.full((1, args.max_seq_len), pad_id, dtype=token_dtype),
-            torch.ones((1, args.max_seq_len), dtype=token_dtype),
-            torch.tensor([0], dtype=torch.int32),
-        )
-        trace_len = int(args.max_seq_len)
-        with _patch_gqa_attention(torch):
-            ov_model = ov.convert_model(
-                LogitsOnly(model).eval(),
-                example_input=example_input,
-                dynamo=True,
-            )
-
-        ov_model.inputs[0].get_tensor().set_names({"input_ids"})
-        ov_model.inputs[1].get_tensor().set_names({"attention_mask"})
-        ov_model.inputs[2].get_tensor().set_names({"beam_idx"})
-        ov_model.outputs[0].get_tensor().set_names({"logits"})
-
-        shapes = {
-            "input_ids": ov.PartialShape([1, trace_len] if npu else [-1, -1]),
-            "attention_mask": ov.PartialShape([1, trace_len] if npu else [-1, -1]),
-            "beam_idx": ov.PartialShape([1] if npu else [-1]),
-        }
-        try:
-            ov_model.reshape(shapes)
-        except Exception:
-            if npu:
-                raise
-            print("warning: converted model kept the traced prompt shape.", file=sys.stderr)
 
     del model
     gc.collect()
     ov_model = _compress_weights(ov_model, weight_format, npu=npu)
     _save_model(ov, ov_model, output_dir / "openvino_model.xml", fp16=weight_format == "fp16")
     _save_tokenizer_and_configs(ov, tokenizer, args, output_dir)
-    _write_info(output_dir, _conversion_info(args, weight_format, trace_len, uses_kv_cache=bool(args.kv_cache)))
+    _write_info(output_dir, _conversion_info(args, weight_format, trace_len=trace_len))
     print(f"Saved OpenVINO model directory to: {output_dir}", file=sys.stderr)
     return 0
 
 
-def _conversion_info(args: Any, weight_format: str, trace_len: int | None, *, uses_kv_cache: bool) -> dict[str, Any]:
+def _conversion_info(args: Any, weight_format: str, trace_len: int | None) -> dict[str, Any]:
     npu = _is_npu(args.target_device)
     info = {
         "model": args.model,
@@ -575,21 +549,21 @@ def _conversion_info(args: Any, weight_format: str, trace_len: int | None, *, us
         "trace_sequence_length": trace_len,
         "static_shapes": npu,
         "input_dtype": "int32" if npu else "int64",
-        "uses_kv_cache": uses_kv_cache,
+        "uses_kv_cache": not npu,
+        "stateful": not npu,
     }
-    if uses_kv_cache:
+    if not npu:
         info["kv_cache_format_version"] = 4
-        info["stateful"] = True
-        config_path = Path(args.output_dir) / "config.json"
-        try:
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            info.update(
-                {
-                    "num_hidden_layers": config["num_hidden_layers"],
-                    "num_key_value_heads": config["num_key_value_heads"],
-                    "head_dim": config["head_dim"],
-                }
-            )
-        except Exception:
-            pass
+    config_path = Path(args.output_dir) / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        info.update(
+            {
+                "num_hidden_layers": config["num_hidden_layers"],
+                "num_key_value_heads": config["num_key_value_heads"],
+                "head_dim": config["head_dim"],
+            }
+        )
+    except Exception:
+        pass
     return info

@@ -60,25 +60,12 @@ def build_parser() -> argparse.ArgumentParser:
     convert_parser.add_argument(
         "--max-seq-len",
         type=int,
-        help="Trace with this fixed sequence length.",
+        help="Fixed sequence length for NPU export. Default: 512 when --target-device NPU.",
     )
     convert_parser.add_argument(
         "--target-device",
         default="CPU",
-        help=(
-            "Device to optimize the exported IR for. Use NPU to keep static shapes and int32 "
-            "token inputs. Default: CPU."
-        ),
-    )
-    convert_parser.add_argument(
-        "--kv-cache",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Export a stateful KV-cache model compatible with OpenVINO GenAI incremental "
-            "inference (default). Use --no-kv-cache for a full-context model that recomputes "
-            "the whole prompt every step. NPU targets always use --no-kv-cache."
-        ),
+        help="Device hint for export. NPU uses static int32 inputs and NPU-friendly compression.",
     )
     convert_parser.add_argument(
         "--force",

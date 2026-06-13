@@ -217,6 +217,7 @@ class DirectOpenVINOGenerator:
         core = ov.Core()
         model = core.read_model(self.model_dir / "openvino_model.xml")
         self.input_names = {item.get_any_name(): item for item in model.inputs}
+        self.input_dtype = np.int32 if self._read_info().get("input_dtype") == "int32" else np.int64
         self.stateful = "position_ids" in self.input_names and bool(getattr(model, "get_variables", list)())
         self.output = model.output(0)
         output_shape = list(model.output(0).get_partial_shape())
@@ -240,9 +241,9 @@ class DirectOpenVINOGenerator:
 
     def _infer_stateful(self, token_ids: list[int], start_position: int, total_len: int) -> Any:
         inputs = {
-            "input_ids": np.array([token_ids], dtype=np.int64),
-            "attention_mask": np.ones((1, total_len), dtype=np.int64),
-            "position_ids": np.arange(start_position, start_position + len(token_ids), dtype=np.int64)[None],
+            "input_ids": np.array([token_ids], dtype=self.input_dtype),
+            "attention_mask": np.ones((1, total_len), dtype=self.input_dtype),
+            "position_ids": np.arange(start_position, start_position + len(token_ids), dtype=self.input_dtype)[None],
             "beam_idx": np.array([0], dtype=np.int32),
         }
         self.request.infer(inputs)
@@ -283,8 +284,8 @@ class DirectOpenVINOGenerator:
         if self.stateful:
             return self._generate_stateful(prompt, print_output=print_output)
         encoded = self.tokenizer(prompt, return_tensors="np")
-        input_ids = encoded["input_ids"].astype(np.int64)
-        attention_mask = encoded["attention_mask"].astype(np.int64)
+        input_ids = encoded["input_ids"].astype(self.input_dtype)
+        attention_mask = encoded["attention_mask"].astype(self.input_dtype)
         prompt_len = int(input_ids.shape[1])
         if prompt_len >= self.trace_len:
             die(
@@ -294,8 +295,8 @@ class DirectOpenVINOGenerator:
 
         max_new_tokens = min(self.args.max_new_tokens, self.trace_len - prompt_len)
         pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0
-        tokens = np.full((1, self.trace_len), pad_id, dtype=np.int64)
-        mask = np.zeros((1, self.trace_len), dtype=np.int64)
+        tokens = np.full((1, self.trace_len), pad_id, dtype=self.input_dtype)
+        mask = np.zeros((1, self.trace_len), dtype=self.input_dtype)
         tokens[:, :prompt_len] = input_ids
         mask[:, :prompt_len] = attention_mask
 
