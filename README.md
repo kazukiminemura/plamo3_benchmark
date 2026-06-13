@@ -232,6 +232,14 @@ direct fallback は次の IR を扱います。
 このリポジトリの変換経路は `optimum-cli` を使いません。Hugging Face model を読み込み、
 `openvino.convert_model` で OpenVINO IR を作ります。
 
+変換まわりのコードは役割ごとに分けています。
+
+- `model_convert.py`: CLI から呼ばれる変換フロー全体
+- `model_download.py`: Hugging Face access check、tokenizer/model loading
+- `model_export.py`: PLaMo 3 固有の PyTorch wrapper と OpenVINO export
+- `model_artifacts.py`: model/tokenizer/config/metadata の保存
+- `quantization.py`: target 判定と NNCF weight compression
+
 CPU / GPU 向け stateful 変換では `torch.export` で次の wrapper を変換します。
 
 - PLaMo 3 の GQA attention を変換時だけ K/V head expansion できるよう patch
