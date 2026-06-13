@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="980" viewBox="0 0 1600 980" role="img" aria-labelledby="title desc">
+  <title id="title">a6b23a1 の推論コード変更説明</title>
+  <desc id="desc">コミット a6b23a1 Add stateful KV-cache conversion で、src/plamo3_benchmark/inference.py の推論処理がどう変わったかを示す図。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f6f2ea; }
+      .ink { fill: #1f2933; }
+      .muted { fill: #5c6875; }
+      .panel { fill: #ffffff; stroke: #d8d1c4; stroke-width: 2; }
+      .panel2 { fill: #fdfaf4; stroke: #d8d1c4; stroke-width: 2; }
+      .green { fill: #dbeedb; stroke: #6fa36c; stroke-width: 2; }
+      .blue { fill: #dce9f7; stroke: #5c88bd; stroke-width: 2; }
+      .amber { fill: #f7e6bf; stroke: #c79a35; stroke-width: 2; }
+      .red { fill: #f4d6d0; stroke: #c36a5a; stroke-width: 2; }
+      .code { fill: #263238; }
+      .codeText { fill: #e6edf3; font-family: Consolas, "Courier New", monospace; font-size: 25px; }
+      .h1 { font-family: "Yu Gothic", "Meiryo", Arial, sans-serif; font-size: 48px; font-weight: 700; }
+      .h2 { font-family: "Yu Gothic", "Meiryo", Arial, sans-serif; font-size: 31px; font-weight: 700; }
+      .txt { font-family: "Yu Gothic", "Meiryo", Arial, sans-serif; font-size: 25px; }
+      .small { font-family: "Yu Gothic", "Meiryo", Arial, sans-serif; font-size: 21px; }
+      .tiny { font-family: "Yu Gothic", "Meiryo", Arial, sans-serif; font-size: 18px; }
+      .mono { font-family: Consolas, "Courier New", monospace; font-size: 22px; }
+      .arrow { stroke: #334155; stroke-width: 4; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #64748b; stroke-width: 3; fill: none; stroke-dasharray: 8 8; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#334155"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="980"/>
+  <text class="h1 ink" x="70" y="88">推論コードで何を変えたか</text>
+  <text class="txt muted" x="72" y="128">参照コミット: a6b23a1 “Add stateful KV-cache conversion” / 対象: src/plamo3_benchmark/inference.py</text>
+
+  <rect class="panel" x="70" y="170" width="430" height="235" rx="8"/>
+  <text class="h2 ink" x="100" y="220">変更前</text>
+  <text class="txt ink" x="100" y="268">Direct OpenVINO fallback は</text>
+  <text class="txt ink" x="100" y="305">固定長バッファへ毎回投入</text>
+  <text class="small muted" x="100" y="350">input_ids + attention_mask</text>
+  <text class="small muted" x="100" y="378">必要なら beam_idx</text>
+
+  <rect class="panel" x="585" y="170" width="430" height="235" rx="8"/>
+  <text class="h2 ink" x="615" y="220">問題</text>
+  <text class="txt ink" x="615" y="268">stateful KV-cache IR は</text>
+  <text class="txt ink" x="615" y="305">内部状態を持つため、</text>
+  <text class="txt ink" x="615" y="342">通常の固定長ループでは</text>
+  <text class="txt ink" x="615" y="379">うまく扱えない</text>
+
+  <rect class="green" x="1100" y="170" width="430" height="235" rx="8"/>
+  <text class="h2 ink" x="1130" y="220">変更後</text>
+  <text class="txt ink" x="1130" y="268">stateful モデルを検出し、</text>
+  <text class="txt ink" x="1130" y="305">専用の生成経路へ分岐</text>
+  <text class="small muted" x="1130" y="350">position_ids + reset_state()</text>
+  <text class="small muted" x="1130" y="378">1 token ずつ KV-cache 更新</text>
+
+  <path class="arrow" d="M510 287 C540 287 550 287 575 287"/>
+  <path class="arrow" d="M1025 287 C1055 287 1065 287 1090 287"/>
+
+  <rect class="panel2" x="70" y="455" width="1460" height="380" rx="8"/>
+  <text class="h2 ink" x="100" y="510">生成フローの差分</text>
+
+  <rect class="blue" x="105" y="555" width="305" height="95" rx="8"/>
+  <text class="txt ink" x="132" y="594">モデル読込</text>
+  <text class="small muted" x="132" y="626">input_names を見る</text>
+
+  <rect class="amber" x="500" y="555" width="360" height="95" rx="8"/>
+  <text class="txt ink" x="527" y="594">stateful 判定を追加</text>
+  <text class="small muted" x="527" y="626">position_ids と variables</text>
+
+  <rect class="green" x="950" y="555" width="480" height="95" rx="8"/>
+  <text class="txt ink" x="977" y="594">stateful 用 InferRequest を作成</text>
+  <text class="small muted" x="977" y="626">create_infer_request()</text>
+
+  <path class="arrow" d="M420 602 L488 602"/>
+  <path class="arrow" d="M872 602 L938 602"/>
+
+  <rect class="code" x="105" y="700" width="420" height="82" rx="8"/>
+  <text class="codeText" x="130" y="733">self.request.reset_state()</text>
+  <text class="codeText" x="130" y="764">prompt を一度流す</text>
+
+  <rect class="code" x="590" y="700" width="420" height="82" rx="8"/>
+  <text class="codeText" x="615" y="733">next_id を sample</text>
+  <text class="codeText" x="615" y="764">1 token だけ infer</text>
+
+  <rect class="code" x="1075" y="700" width="420" height="82" rx="8"/>
+  <text class="codeText" x="1100" y="733">position_ids を進める</text>
+  <text class="codeText" x="1100" y="764">KV-cache は内部状態</text>
+
+  <path class="arrow" d="M537 741 L578 741"/>
+  <path class="arrow" d="M1022 741 L1063 741"/>
+  <path class="dash" d="M1300 694 C1340 640 1280 610 1195 656"/>
+
+  <rect class="red" x="70" y="865" width="700" height="70" rx="8"/>
+  <text class="txt ink" x="100" y="909">副変更: GenAI の apply_chat_template は CLI 指定時だけ有効</text>
+
+  <rect class="green" x="830" y="865" width="700" height="70" rx="8"/>
+  <text class="txt ink" x="860" y="909">効果: GenAI 非対応時でも stateful KV-cache IR で生成可能</text>
+</svg>

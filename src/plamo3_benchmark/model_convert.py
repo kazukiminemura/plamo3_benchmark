@@ -198,6 +198,7 @@ def _save_tokenizer_and_configs(ov: Any, tokenizer: Any, args: Any, output_dir: 
         if path.exists():
             path.unlink()
     tokenizer.save_pretrained(output_dir)
+    _patch_chat_template_for_openvino_tokenizer(output_dir)
     try:
         ov_tokenizer, ov_detokenizer = _convert_tokenizer_to_ir(tokenizer)
         ov.save_model(ov_tokenizer, output_dir / "openvino_tokenizer.xml")
@@ -212,6 +213,17 @@ def _save_tokenizer_and_configs(ov: Any, tokenizer: Any, args: Any, output_dir: 
     _write_json_if_present(args.model, output_dir, "generation_config.json", local_files_only=args.local_files_only)
     if not (output_dir / "generation_config.json").exists():
         (output_dir / "generation_config.json").write_text('{"max_new_tokens": 128}\n', encoding="utf-8")
+
+
+def _patch_chat_template_for_openvino_tokenizer(output_dir: Path) -> None:
+    template_path = output_dir / "chat_template.jinja"
+    if not template_path.exists():
+        return
+
+    text = template_path.read_text(encoding="utf-8")
+    patched = text.replace("{{- bos_token + '<|plamo:tag|>' -}}", "{{- '<|plamo:tag|>' -}}", 1)
+    if patched != text:
+        template_path.write_text(patched, encoding="utf-8")
 
 
 def _read_info(output_dir: Path) -> dict[str, Any]:

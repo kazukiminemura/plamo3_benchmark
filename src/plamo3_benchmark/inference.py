@@ -18,6 +18,12 @@ except ImportError as exc:
     raise exc
 
 
+DEFAULT_CHAT_SYSTEM = (
+    "You are a helpful AI assistant. Answer naturally and directly in the user's language."
+)
+CHAT_STOP_STRINGS = ("\nUser:", "\nSystem:", "\nAssistant:", "\nユーザー:", "\nシステム:", "\nアシスタント:")
+
+
 def read_prompt(args: Any) -> str:
     sources = [args.prompt is not None, args.prompt_file is not None, args.stdin]
     if sum(sources) > 1:
@@ -60,9 +66,7 @@ def _sample_next_token(logits: Any, args: Any) -> int:
 
 
 def _format_chat_prompt(messages: list[dict[str, str]], system_prompt: str | None) -> str:
-    parts: list[str] = []
-    if system_prompt:
-        parts.append(f"System: {system_prompt.strip()}")
+    parts: list[str] = [f"System: {(system_prompt or DEFAULT_CHAT_SYSTEM).strip()}"]
     for message in messages:
         role = "User" if message["role"] == "user" else "Assistant"
         parts.append(f"{role}: {message['content'].strip()}")
@@ -95,17 +99,28 @@ def _print_generation_metrics(
 
 
 class OpenVINOGenAIGenerator:
-    uses_native_chat = True
-
     def __init__(self, args: Any) -> None:
         self.args = args
         self.in_chat = False
+        self.model_dir = Path(args.model)
+        self.model_info = self._read_info()
+        self.uses_native_chat = not self._is_base_model()
         self.tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, use_fast=False)
-        self._check_genai_model_inputs(Path(args.model))
+        self._check_genai_model_inputs(self.model_dir)
         print(f"Using OpenVINO GenAI inference device: {args.device}", file=sys.stderr)
         started_at = time.perf_counter()
         self.pipe = ov_genai.LLMPipeline(str(args.model), args.device)
         self.model_load_seconds = time.perf_counter() - started_at
+
+    def _read_info(self) -> dict[str, Any]:
+        try:
+            return json.loads((self.model_dir / "plamo3_ov_conversion.json").read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _is_base_model(self) -> bool:
+        model_id = str(self.model_info.get("model", "")).lower()
+        return model_id.endswith("-base") or "base" in model_id.rsplit("/", 1)[-1].split("-")
 
     @staticmethod
     def _check_genai_model_inputs(model_dir: Path) -> None:
@@ -148,7 +163,7 @@ class OpenVINOGenAIGenerator:
         except Exception:
             return len(self.tokenizer.encode(text, add_special_tokens=False))
 
-    def generate(self, prompt: str, *, print_output: bool) -> str:
+    def generate(self, prompt: str, *, print_output: bool, stop_strings: tuple[str, ...] = ()) -> str:
         first_token_time: float | None = None
 
         def streamer(token: str) -> bool:
@@ -163,6 +178,8 @@ class OpenVINOGenAIGenerator:
             max_new_tokens=self.args.max_new_tokens,
             do_sample=False,
             apply_chat_template=not self.in_chat and bool(getattr(self.args, "apply_chat_template", False)),
+            stop_strings=set(stop_strings),
+            include_stop_str_in_output=False,
             streamer=streamer,
         )
         finished_at = time.perf_counter()
@@ -179,11 +196,13 @@ class OpenVINOGenAIGenerator:
         return text
 
     def start_chat(self, system_message: str = "") -> None:
+        if not self.uses_native_chat:
+            return
         self.pipe.start_chat(system_message)
         self.in_chat = True
 
     def finish_chat(self) -> None:
-        if self.in_chat:
+        if self.uses_native_chat and self.in_chat:
             self.pipe.finish_chat()
             self.in_chat = False
 
@@ -260,7 +279,7 @@ class DirectOpenVINOGenerator:
         _print_generation_metrics(None, len(generated), start_time, first_token_time, finished_at=time.perf_counter())
         return text
 
-    def generate(self, prompt: str, *, print_output: bool) -> str:
+    def generate(self, prompt: str, *, print_output: bool, stop_strings: tuple[str, ...] = ()) -> str:
         if self.stateful:
             return self._generate_stateful(prompt, print_output=print_output)
         encoded = self.tokenizer(prompt, return_tensors="np")
@@ -360,6 +379,8 @@ def chat(args: Any) -> int:
         "Type /exit or /quit to leave, /reset to clear history.",
         file=sys.stderr,
     )
+    if not generator.uses_native_chat:
+        print("Using prompt-formatted chat for a base model.", file=sys.stderr)
     messages: list[dict[str, str]] = []
     generator.start_chat(args.system or "")
     try:
@@ -389,7 +410,9 @@ def chat(args: Any) -> int:
             else:
                 messages.append({"role": "user", "content": user_text})
                 prompt = _format_chat_prompt(messages, args.system)
-                assistant_text = generator.generate(prompt, print_output=True).strip()
+                assistant_text = generator.generate(
+                    prompt, print_output=True, stop_strings=CHAT_STOP_STRINGS
+                ).strip()
                 messages.append({"role": "assistant", "content": assistant_text})
             turns += 1
 
