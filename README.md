@@ -233,7 +233,6 @@ direct fallback は次の IR を扱います。
 
 - CPU / GPU 向け stateful IR: OpenVINO InferRequest の state を reset しながら逐次生成
 - NPU 向け static stateful IR: int32 入力で OpenVINO InferRequest の固定長KV stateを reset しながら逐次生成
-- 古い fixed IR: metadata の `trace_sequence_length` または入出力 shape の範囲内で生成
 
 ## Conversion Details
 
