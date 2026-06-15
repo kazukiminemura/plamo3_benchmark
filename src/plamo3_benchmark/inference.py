@@ -86,6 +86,7 @@ def _print_generation_metrics(
     if finished_at is None:
         finished_at = time.perf_counter()
     first_token_seconds = None if first_token_time is None else first_token_time - start_time
+    total_inference_seconds = finished_at - start_time
     decode_time = None if first_token_time is None else max(finished_at - first_token_time, 1e-9)
     tokens_per_second = 0.0 if decode_time is None else token_count / decode_time
     load_text = "" if model_load_seconds is None else f"model_load: {model_load_seconds:.3f}s | "
@@ -93,6 +94,7 @@ def _print_generation_metrics(
     print(
         f"[metrics] {load_text}"
         f"time_to_first_token: {first_token_text} | "
+        f"total_inference: {total_inference_seconds:.3f}s | "
         f"output_tokens: {token_count} | "
         f"tokens/sec: {tokens_per_second:.2f}",
         file=sys.stderr,
@@ -212,6 +214,7 @@ class DirectOpenVINOGenerator:
     uses_native_chat = False
 
     def __init__(self, args: Any) -> None:
+        started_at = time.perf_counter()
         self.args = args
         self.model_dir = Path(args.model)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir, trust_remote_code=True, use_fast=False)
@@ -243,6 +246,7 @@ class DirectOpenVINOGenerator:
         self.compiled = core.compile_model(model, args.device)
         self.compiled_output = self.compiled.output(0)
         self.request = self.compiled.create_infer_request() if self.stateful else None
+        self.model_load_seconds = time.perf_counter() - started_at
 
     def _read_info(self) -> dict[str, Any]:
         try:
@@ -307,7 +311,13 @@ class DirectOpenVINOGenerator:
             print()
         elif print_output:
             print(text)
-        _print_generation_metrics(None, len(generated), start_time, first_token_time, finished_at=time.perf_counter())
+        _print_generation_metrics(
+            self.model_load_seconds,
+            len(generated),
+            start_time,
+            first_token_time,
+            finished_at=time.perf_counter(),
+        )
         return text
 
     def generate(self, prompt: str, *, print_output: bool, stop_strings: tuple[str, ...] = ()) -> str:
@@ -356,7 +366,13 @@ class DirectOpenVINOGenerator:
             print()
         elif print_output:
             print(text)
-        _print_generation_metrics(None, len(generated), start_time, first_token_time, finished_at=time.perf_counter())
+        _print_generation_metrics(
+            self.model_load_seconds,
+            len(generated),
+            start_time,
+            first_token_time,
+            finished_at=time.perf_counter(),
+        )
         return text
 
     def start_chat(self, system_message: str = "") -> None:
