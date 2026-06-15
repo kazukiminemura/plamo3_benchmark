@@ -60,12 +60,12 @@ def build_parser() -> argparse.ArgumentParser:
     convert_parser.add_argument(
         "--max-seq-len",
         type=int,
-        help="Deprecated. NPU export now uses stateful KV-cache IR and ignores this value.",
+        help="Static KV-cache length for NPU export. Default: 512 when --target-device NPU.",
     )
     convert_parser.add_argument(
         "--target-device",
         default="CPU",
-        help="Device hint for export. NPU uses int32 inputs, stateful KV-cache, and NPU-friendly compression.",
+        help="Device hint for export. NPU uses static int32 inputs, stateful KV-cache, and NPU-friendly compression.",
     )
     convert_parser.add_argument(
         "--force",

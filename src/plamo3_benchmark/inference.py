@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import openvino as ov
 from .common import die, looks_like_openvino_dir
+from .quantization import is_npu
 from transformers import AutoTokenizer
 
 try:
@@ -216,9 +217,19 @@ class DirectOpenVINOGenerator:
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir, trust_remote_code=True, use_fast=False)
         core = ov.Core()
         model = core.read_model(self.model_dir / "openvino_model.xml")
+        self.model_info = self._read_info()
         self.input_names = {item.get_any_name(): item for item in model.inputs}
-        self.input_dtype = np.int32 if self._read_info().get("input_dtype") == "int32" else np.int64
+        self.input_dtype = np.int32 if self.model_info.get("input_dtype") == "int32" else np.int64
         self.stateful = "position_ids" in self.input_names and bool(getattr(model, "get_variables", list)())
+        self.stateful_input_len = None
+        self.stateful_attention_len = None
+        if self.stateful:
+            input_shape = list(self.input_names["input_ids"].get_partial_shape())
+            if len(input_shape) > 1 and input_shape[1].is_static:
+                self.stateful_input_len = input_shape[1].get_length()
+            attention_shape = list(self.input_names["attention_mask"].get_partial_shape())
+            if len(attention_shape) > 1 and attention_shape[1].is_static:
+                self.stateful_attention_len = attention_shape[1].get_length()
         self.output = model.output(0)
         output_shape = list(model.output(0).get_partial_shape())
         self.trace_len = output_shape[1].get_length() if len(output_shape) > 1 and output_shape[1].is_static else None
@@ -240,9 +251,19 @@ class DirectOpenVINOGenerator:
             return {}
 
     def _infer_stateful(self, token_ids: list[int], start_position: int, total_len: int) -> Any:
+        if self.stateful_input_len is not None and len(token_ids) != self.stateful_input_len:
+            die(f"Stateful model expects {self.stateful_input_len} token(s) per inference, got {len(token_ids)}.")
+        attention_len = self.stateful_attention_len or total_len
+        if total_len > attention_len:
+            die(
+                f"Sequence length ({total_len}) exceeds the traced KV-cache length ({attention_len}). "
+                "Use /reset, shorten the prompt, or reconvert with a larger --max-seq-len."
+            )
+        attention_mask = np.zeros((1, attention_len), dtype=self.input_dtype)
+        attention_mask[:, :total_len] = 1
         inputs = {
             "input_ids": np.array([token_ids], dtype=self.input_dtype),
-            "attention_mask": np.ones((1, total_len), dtype=self.input_dtype),
+            "attention_mask": attention_mask,
             "position_ids": np.arange(start_position, start_position + len(token_ids), dtype=self.input_dtype)[None],
             "beam_idx": np.array([0], dtype=np.int32),
         }
@@ -258,8 +279,17 @@ class DirectOpenVINOGenerator:
         first_token_time: float | None = None
 
         self.request.reset_state()
-        logits = self._infer_stateful(prompt_ids, 0, len(prompt_ids))[0, -1]
-        position = len(prompt_ids)
+        if self.stateful_input_len == 1:
+            logits = None
+            position = 0
+            for token_id in prompt_ids:
+                logits = self._infer_stateful([token_id], position, position + 1)[0, -1]
+                position += 1
+            if logits is None:
+                die("Prompt produced no tokens.")
+        else:
+            logits = self._infer_stateful(prompt_ids, 0, len(prompt_ids))[0, -1]
+            position = len(prompt_ids)
         for _ in range(self.args.max_new_tokens):
             next_id = _sample_next_token(logits, self.args)
             if next_id in eos_ids:
@@ -348,6 +378,13 @@ def _is_genai_compatible(model_dir: Path) -> bool:
     return len(output_shape) < 2 or output_shape[1].is_dynamic
 
 
+def _read_model_info(model_dir: Path) -> dict[str, Any]:
+    try:
+        return json.loads((model_dir / "plamo3_ov_conversion.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def load_generator(args: Any) -> OpenVINOGenAIGenerator:
     model_source = args.model
     if not looks_like_openvino_dir(model_source):
@@ -356,6 +393,14 @@ def load_generator(args: Any) -> OpenVINOGenAIGenerator:
             "Run `plamo3-ov convert --output-dir ov-plamo3` first."
         )
     model_dir = Path(model_source)
+    model_info = _read_model_info(model_dir)
+    if is_npu(args.device) or is_npu(model_info.get("target_device")):
+        print(
+            "warning: NPU stateful KV-cache IR is not handled by OpenVINO GenAI LLMPipeline; "
+            "falling back to direct OpenVINO generation.",
+            file=sys.stderr,
+        )
+        return DirectOpenVINOGenerator(args)
     if _is_genai_compatible(model_dir):
         return OpenVINOGenAIGenerator(args)
     print(

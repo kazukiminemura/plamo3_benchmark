@@ -28,8 +28,59 @@ def patch_gqa_attention(torch: Any) -> Any:
 
 
 def export_openvino_model(args: Any, tokenizer: Any, model: Any, ov: Any, torch: Any, dtype: Any) -> tuple[Any, int | None]:
+    if is_npu(args.target_device):
+        return _export_npu_model(args, model, ov, torch, dtype)
     input_dtype = torch.int32 if is_npu(args.target_device) else torch.int64
     return _export_stateful_model(model, ov, torch, dtype, input_dtype=input_dtype)
+
+
+def _export_npu_model(args: Any, model: Any, ov: Any, torch: Any, dtype: Any) -> tuple[Any, int]:
+    layers = int(getattr(model.config, "num_hidden_layers"))
+    kv_heads = int(getattr(model.config, "num_key_value_heads"))
+    head_dim = int(getattr(model.config, "head_dim"))
+    trace_len = int(args.max_seq_len)
+    example_input = (
+        torch.ones((1, 1), dtype=torch.int32),
+        torch.ones((1, trace_len), dtype=torch.int32),
+        torch.zeros((1, 1), dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+        *(torch.zeros((1, kv_heads, trace_len, head_dim), dtype=dtype) for _ in range(layers * 2)),
+    )
+    with patch_gqa_attention(torch):
+        ov_model = ov.convert_model(StaticStatefulKV(model, trace_len).eval(), example_input=example_input, dynamo=True)
+
+    for node, name in zip(ov_model.inputs[:4], ("input_ids", "attention_mask", "position_ids", "beam_idx")):
+        node.get_tensor().set_names({name})
+    ov_model.outputs[0].get_tensor().set_names({"logits"})
+
+    def cache_name(prefix: str, idx: int) -> str:
+        return f"{prefix}.{idx // 2}.{'key' if idx % 2 == 0 else 'value'}"
+
+    state_pairs = {}
+    for idx, node in enumerate(ov_model.inputs[4:]):
+        node.get_tensor().set_names({cache_name("past", idx)})
+    for idx, node in enumerate(ov_model.outputs[1:]):
+        node.get_tensor().set_names({cache_name("present", idx)})
+        state_pairs[cache_name("past", idx)] = cache_name("present", idx)
+
+    ov_model.reshape(
+        {
+            "input_ids": ov.PartialShape([1, 1]),
+            "attention_mask": ov.PartialShape([1, trace_len]),
+            "position_ids": ov.PartialShape([1, 1]),
+            "beam_idx": ov.PartialShape([1]),
+            **{
+                node.get_any_name(): ov.PartialShape([1, kv_heads, trace_len, head_dim])
+                for node in ov_model.inputs
+                if node.get_any_name().startswith("past.")
+            },
+        }
+    )
+
+    from openvino._offline_transformations import apply_make_stateful_transformation
+
+    apply_make_stateful_transformation(ov_model, state_pairs)
+    return ov_model, trace_len
 
 
 def _export_stateful_model(model: Any, ov: Any, torch: Any, dtype: Any, *, input_dtype: Any) -> tuple[Any, None]:
@@ -185,3 +236,65 @@ class StatefulKV(nn.Module):
         logits = self.model.lm_head(base.norm(hidden_states)).to(torch.float32)
         logits = logits + attention_mask.to(logits.dtype).sum() * 0
         return (logits, *flat_cache)
+
+
+class StaticStatefulKV(StatefulKV):
+    """Stateful KV-cache wrapper with static cache tensors for NPU."""
+
+    def __init__(self, model: Any, cache_len: int) -> None:
+        super().__init__(model)
+        self.cache_len = int(cache_len)
+
+    def attention(
+        self,
+        mixer: Any,
+        hidden_states: Any,
+        position_ids: Any,
+        past_key: Any,
+        past_value: Any,
+    ) -> tuple[Any, Any, Any]:
+        import torch
+        import torch.nn.functional as F
+
+        bsz, q_len, _ = hidden_states.size()
+        qkv = mixer.qkv_proj(hidden_states)
+        query_states, key_states, value_states = torch.split(
+            qkv, [mixer.q_proj_dim, mixer.k_proj_dim, mixer.v_proj_dim], dim=-1
+        )
+        query_states = query_states.view(bsz, q_len, mixer.q_num_heads, mixer.qk_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, mixer.k_num_heads, mixer.qk_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, mixer.v_num_heads, mixer.v_dim).transpose(1, 2)
+
+        attn_dtype = query_states.dtype
+        query_states = mixer.q_norm(query_states)
+        key_states = mixer.k_norm(key_states)
+
+        cache_pos = position_ids.to(torch.long).clamp(0, self.cache_len - 1)
+        key_index = cache_pos[:, None, :, None].expand(bsz, mixer.k_num_heads, q_len, mixer.qk_dim)
+        value_index = cache_pos[:, None, :, None].expand(bsz, mixer.v_num_heads, q_len, mixer.v_dim)
+        key_states = past_key.scatter(-2, key_index, key_states)
+        value_states = past_value.scatter(-2, value_index, value_states)
+
+        max_pos = mixer.config.max_position_embeddings
+        q_pos = position_ids.to(torch.long)
+        k_pos = torch.arange(self.cache_len, dtype=torch.long, device=hidden_states.device)[None]
+
+        cos, sin = mixer.rotary_emb(value_states, seq_len=max_pos)
+        query_states = self.rotary_pos_emb(query_states, cos, sin, q_pos.clamp(0, max_pos - 1)).to(attn_dtype)
+        rotated_key_states = self.rotary_pos_emb(key_states, cos, sin, k_pos.clamp(0, max_pos - 1)).to(attn_dtype)
+        value_states = value_states.to(attn_dtype)
+
+        visible = k_pos[:, None, :] <= q_pos[:, :, None]
+        if not mixer.full_attn:
+            visible = visible & (k_pos[:, None, :] > q_pos[:, :, None] - self.window)
+        attn_mask = torch.where(visible, 0.0, float("-inf")).to(attn_dtype)[:, None]
+
+        attn_output = F.scaled_dot_product_attention(
+            query_states,
+            rotated_key_states,
+            value_states,
+            attn_mask=attn_mask,
+            enable_gqa=True,
+        )
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, mixer.q_num_heads * mixer.v_dim)
+        return mixer.o_proj(attn_output), key_states, value_states

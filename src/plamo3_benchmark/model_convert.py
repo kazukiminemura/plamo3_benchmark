@@ -28,8 +28,9 @@ def convert(args: Any) -> int:
     ensure_model_access(args.model, local_files_only=args.local_files_only)
 
     target_is_npu = is_npu(args.target_device)
-    if target_is_npu and args.max_seq_len is not None:
-        print("NPU target now uses stateful KV-cache IR; ignoring --max-seq-len.", file=sys.stderr)
+    if target_is_npu and args.max_seq_len is None:
+        args.max_seq_len = 512
+        print("NPU target requested; using --max-seq-len 512 for static KV-cache.", file=sys.stderr)
 
     ov = _import_openvino()
     tokenizer = load_tokenizer(args)
@@ -50,7 +51,10 @@ def _update_existing(args: Any, output_dir: Path, xml_path: Path, tokenizer: Any
         die(f"Existing model is {info['weight_format']}; re-run with `--force` to save {format_name}.")
 
     save_tokenizer_and_configs(ov, tokenizer, args, output_dir)
-    write_info(output_dir, _conversion_info(args, format_name, trace_len=trace_len(ov, xml_path)))
+    existing_len = trace_len(ov, xml_path)
+    if target_is_npu:
+        existing_len = int(args.max_seq_len or info.get("trace_sequence_length") or existing_len or 512)
+    write_info(output_dir, _conversion_info(args, format_name, trace_len=existing_len))
     print(f"Updated existing OpenVINO model directory: {output_dir}", file=sys.stderr)
     return 0
 
@@ -61,10 +65,16 @@ def _validate_existing_ir(args: Any, ov: Any, xml_path: Path, info: dict[str, An
     stateful = "beam_idx" in input_names and bool(getattr(model, "get_variables", list)())
 
     if target_is_npu:
-        if not stateful or info.get("input_dtype") != "int32":
-            die("Existing model is not NPU stateful KV-cache/int32 IR; re-run convert with `--force`.")
+        existing_len = int(info.get("trace_sequence_length") or 0) or None
+        if info.get("static_shapes") is not True or not stateful or info.get("input_dtype") != "int32":
+            die("Existing model is not NPU static stateful KV-cache/int32 IR; re-run convert with `--force`.")
         if info.get("kv_cache_format_version") != 4:
             die("Existing NPU stateful model uses an old KV-cache layout; re-run convert with `--force`.")
+        if args.max_seq_len is not None and existing_len is not None and int(args.max_seq_len) != existing_len:
+            die(
+                f"openvino_model.xml already exists with traced KV-cache length {existing_len}, "
+                f"but --max-seq-len {args.max_seq_len} was requested. Re-run with `--force`."
+            )
         return
 
     if not stateful:
@@ -109,7 +119,7 @@ def _conversion_info(args: Any, format_name: str, trace_len: int | None) -> dict
         "target_device": args.target_device,
         "compression_mode": compression_mode(format_name, npu=target_is_npu),
         "trace_sequence_length": trace_len,
-        "static_shapes": False,
+        "static_shapes": target_is_npu,
         "input_dtype": "int32" if target_is_npu else "int64",
         "uses_kv_cache": True,
         "stateful": True,
