@@ -10,7 +10,7 @@ from .common import die
 from .model_artifacts import read_info, save_model_atomic, save_tokenizer_and_configs, trace_len, write_info
 from .model_download import ensure_model_access, load_causal_lm, load_tokenizer
 from .model_export import export_openvino_model
-from .quantization import compress_weights_for_target, compression_mode, is_npu, weight_format
+from .quantization import compress_weights_for_target, compression_mode, compression_options, is_npu, weight_format
 
 
 def _import_openvino() -> Any:
@@ -62,12 +62,18 @@ def _update_existing(args: Any, output_dir: Path, xml_path: Path, tokenizer: Any
 def _validate_existing_ir(args: Any, ov: Any, xml_path: Path, info: dict[str, Any], *, target_is_npu: bool) -> None:
     model = ov.Core().read_model(xml_path)
     input_names = {item.get_any_name() for item in model.inputs}
-    stateful = "beam_idx" in input_names and bool(getattr(model, "get_variables", list)())
+    has_state = bool(getattr(model, "get_variables", list)())
+    stateful = "position_ids" in input_names and has_state
 
     if target_is_npu:
         existing_len = int(info.get("trace_sequence_length") or 0) or None
-        if info.get("static_shapes") is not True or not stateful or info.get("input_dtype") != "int32":
-            die("Existing model is not NPU static stateful KV-cache/int32 IR; re-run convert with `--force`.")
+        if (
+            info.get("static_shapes") is not True
+            or not stateful
+            or "beam_idx" not in input_names
+            or info.get("input_dtype") != "int32"
+        ):
+            die("Existing model is not NPU static stateful KV-cache/int32 IR with `beam_idx`; re-run convert with `--force`.")
         if info.get("kv_cache_format_version") != 4:
             die("Existing NPU stateful model uses an old KV-cache layout; re-run convert with `--force`.")
         if args.max_seq_len is not None and existing_len is not None and int(args.max_seq_len) != existing_len:
@@ -77,7 +83,7 @@ def _validate_existing_ir(args: Any, ov: Any, xml_path: Path, info: dict[str, An
             )
         return
 
-    if not stateful:
+    if "beam_idx" not in input_names or not stateful:
         die("Existing model is not stateful GenAI IR; re-run convert with `--force`.")
     if info.get("kv_cache_format_version") != 4:
         die("Existing stateful model uses an old KV-cache layout; re-run convert with `--force`.")
@@ -118,11 +124,14 @@ def _conversion_info(args: Any, format_name: str, trace_len: int | None) -> dict
         "weight_format": format_name,
         "target_device": args.target_device,
         "compression_mode": compression_mode(format_name, npu=target_is_npu),
+        "compression_options": compression_options(format_name, npu=target_is_npu),
         "trace_sequence_length": trace_len,
         "static_shapes": target_is_npu,
         "input_dtype": "int32" if target_is_npu else "int64",
         "uses_kv_cache": True,
         "stateful": True,
+        "uses_beam_idx": True,
+        "generation_mode": "beam_compatible",
         "kv_cache_format_version": 4,
     }
 

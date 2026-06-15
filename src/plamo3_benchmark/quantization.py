@@ -11,18 +11,24 @@ def is_npu(device: str | None) -> bool:
 
 
 def weight_format(args: Any) -> str:
-    if is_npu(args.target_device) and args.weight_format == "fp32":
-        print("warning: NPU target requested with fp32; saving FP16 weights instead.", file=sys.stderr)
-        return "fp16"
+    if is_npu(args.target_device) and args.weight_format != "int4":
+        print("warning: NPU target requested; using --weight-format int4.", file=sys.stderr)
+        return "int4"
     return args.weight_format
 
 
 def compression_mode(format_name: str, *, npu: bool) -> str | None:
     if format_name == "int8":
-        return "INT8_SYM" if npu else "INT8_ASYM"
+        return "INT8_ASYM"
     if format_name == "int4":
         return "INT4_SYM" if npu else "INT4_ASYM"
     return None
+
+
+def compression_options(format_name: str, *, npu: bool) -> dict[str, Any]:
+    if npu and format_name == "int4":
+        return {"symmetric": True, "group_size": 128, "ratio": 1.0, "backup_mode": "INT8_SYM"}
+    return {}
 
 
 def compress_weights_for_target(ov_model: Any, format_name: str, *, npu: bool) -> Any:
@@ -31,7 +37,7 @@ def compress_weights_for_target(ov_model: Any, format_name: str, *, npu: bool) -
         return ov_model
 
     try:
-        from nncf import CompressWeightsMode, GroupSizeFallbackMode, compress_weights
+        from nncf import BackupMode, CompressWeightsMode, GroupSizeFallbackMode, compress_weights
         from nncf.quantization.advanced_parameters import AdvancedCompressionParameters
     except ImportError as exc:
         die("NNCF is required for int8/int4 weight compression. Run `uv sync` first.")
@@ -42,7 +48,7 @@ def compress_weights_for_target(ov_model: Any, format_name: str, *, npu: bool) -
     if format_name == "int4":
         advanced_parameters = AdvancedCompressionParameters(group_size_fallback_mode=GroupSizeFallbackMode.ADJUST)
         if npu:
-            kwargs = {"ratio": 1.0, "group_size": -1}
+            kwargs = {"ratio": 1.0, "group_size": 128, "backup_mode": BackupMode.INT8_SYM}
 
     print(f"Compressing OpenVINO model weights to {mode_name} with NNCF...", file=sys.stderr)
     return compress_weights(

@@ -30,8 +30,7 @@ def patch_gqa_attention(torch: Any) -> Any:
 def export_openvino_model(args: Any, tokenizer: Any, model: Any, ov: Any, torch: Any, dtype: Any) -> tuple[Any, int | None]:
     if is_npu(args.target_device):
         return _export_npu_model(args, model, ov, torch, dtype)
-    input_dtype = torch.int32 if is_npu(args.target_device) else torch.int64
-    return _export_stateful_model(model, ov, torch, dtype, input_dtype=input_dtype)
+    return _export_stateful_model(model, ov, torch, dtype, input_dtype=torch.int64)
 
 
 def _export_npu_model(args: Any, model: Any, ov: Any, torch: Any, dtype: Any) -> tuple[Any, int]:
@@ -244,6 +243,39 @@ class StaticStatefulKV(StatefulKV):
     def __init__(self, model: Any, cache_len: int) -> None:
         super().__init__(model)
         self.cache_len = int(cache_len)
+
+    def forward(
+        self,
+        input_ids: Any,
+        attention_mask: Any,
+        position_ids: Any,
+        beam_idx: Any,
+        *past: Any,
+    ) -> tuple[Any, ...]:
+        import torch
+
+        base = self.model.model
+        hidden_states = base.embed_tokens(input_ids.to(torch.long))
+        flat_cache = []
+        for layer_idx, layer in enumerate(base.layers.layers):
+            residual = hidden_states
+            hidden_states = layer.pre_mixer_norm(hidden_states)
+            attn_out, key, value = self.attention(
+                layer.mixer,
+                hidden_states,
+                position_ids,
+                past[layer_idx * 2],
+                past[layer_idx * 2 + 1],
+            )
+            hidden_states = residual + layer.post_mixer_norm(attn_out)
+            residual = hidden_states
+            hidden_states = residual + layer.post_mlp_norm(layer.mlp(layer.pre_mlp_norm(hidden_states)))
+            flat_cache.extend([key, value])
+
+        logits = self.model.lm_head(base.norm(hidden_states)).to(torch.float32)
+        logits = logits + attention_mask.to(logits.dtype).sum() * 0
+        logits = logits + beam_idx.to(logits.dtype).reshape(-1, 1, 1) * 0
+        return (logits, *flat_cache)
 
     def attention(
         self,

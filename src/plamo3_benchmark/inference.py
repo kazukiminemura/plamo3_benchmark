@@ -247,14 +247,14 @@ class DirectOpenVINOGenerator(BaseGenerator):
 
         mask = np.zeros((1, attention_len), dtype=self.input_dtype)
         mask[:, :total_len] = 1
-        self.request.infer(
-            {
-                "input_ids": np.array([token_ids], dtype=self.input_dtype),
-                "attention_mask": mask,
-                "position_ids": np.arange(position, total_len, dtype=self.input_dtype)[None],
-                "beam_idx": np.array([0], dtype=np.int32),
-            }
-        )
+        inputs = {
+            "input_ids": np.array([token_ids], dtype=self.input_dtype),
+            "attention_mask": mask,
+            "position_ids": np.arange(position, total_len, dtype=self.input_dtype)[None],
+        }
+        if "beam_idx" in self.inputs:
+            inputs["beam_idx"] = np.array([0], dtype=np.int32)
+        self.request.infer(inputs)
         return self.request.get_output_tensor(0).data[0, -1]
 
     def _prefill_state(self, prompt_ids: list[int]) -> tuple[Any, int]:
@@ -301,6 +301,7 @@ class DirectOpenVINOGenerator(BaseGenerator):
 
     def generate(self, prompt: str, *, print_output: bool, stop_strings: tuple[str, ...] = ()) -> str:
         return self._generate_stateful(prompt, print_output=print_output)
+
 
 def is_genai_compatible(model_dir: Path) -> bool:
     if not (model_dir / "openvino_tokenizer.xml").exists() or not (model_dir / "openvino_detokenizer.xml").exists():

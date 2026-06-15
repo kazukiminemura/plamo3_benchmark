@@ -67,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "OpenVINO save precision. int8 applies NNCF INT8_ASYM weight compression; "
             "int4 applies NNCF INT4_ASYM weight compression. With --target-device NPU, "
-            "int8/int4 use symmetric compression."
+            "the model is saved as INT4_SYM with group_size=128 and ratio=1.0."
         ),
     )
     convert_parser.add_argument(
@@ -78,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     convert_parser.add_argument(
         "--target-device",
         default="CPU",
-        help="Device hint for export. NPU uses static int32 inputs, stateful KV-cache, and NPU-friendly compression.",
+        help="Device hint for export. NPU uses static int32 token inputs, beam_idx, stateful KV-cache, and NPU-friendly compression.",
     )
     convert_parser.add_argument(
         "--force",
