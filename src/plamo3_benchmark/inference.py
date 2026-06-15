@@ -11,7 +11,6 @@ import openvino as ov
 from transformers import AutoTokenizer
 
 from .common import die, looks_like_openvino_dir
-from .quantization import is_npu
 
 try:
     import openvino_genai as ov_genai
@@ -316,14 +315,6 @@ def load_generator(args: Any) -> Any:
         die(f"{args.model!r} does not look like an exported OpenVINO model. Run `plamo3-ov convert --output-dir ov-plamo3` first.")
 
     model_dir = Path(args.model)
-    model_info = read_model_info(model_dir)
-    if is_npu(args.device) or is_npu(model_info.get("target_device")):
-        print(
-            "warning: NPU stateful KV-cache IR is not handled by OpenVINO GenAI LLMPipeline; "
-            "falling back to direct OpenVINO generation.",
-            file=sys.stderr,
-        )
-        return DirectOpenVINOGenerator(args)
     if is_genai_compatible(model_dir):
         return OpenVINOGenAIGenerator(args)
 
