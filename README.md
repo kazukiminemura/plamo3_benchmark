@@ -131,9 +131,9 @@ NPU 変換では次のように保存します。
 - KV cache: OpenVINO state、shape `[1, kv_heads, max_seq_len, head_dim]`
 - `fp32` 指定時も保存形式は `fp16`
 - NPU では常に `INT4_SYM`
-- `group_size=128`
+- `group_size=-1` の channel-wise compression
 - `ratio=1.0`
-- fallback が必要な場合も `INT8_SYM` を使い、asymmetric compression は使いません
+- embedding / last layer などの fallback は NNCF のNPU互換な既定に任せます
 
 推論時はプロンプトも生成トークンも1トークンずつ流し、固定長KV stateを更新します。
 

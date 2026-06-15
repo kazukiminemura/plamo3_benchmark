@@ -228,7 +228,9 @@ class DirectOpenVINOGenerator(BaseGenerator):
         self.attention_len = static_dim(self.inputs["attention_mask"]) if "attention_mask" in self.inputs else None
 
         print(f"Using direct OpenVINO inference device: {args.device}", file=sys.stderr)
+        print("Compiling OpenVINO model for direct inference...", file=sys.stderr)
         self.compiled = core.compile_model(model, args.device)
+        print("Compiled OpenVINO model for direct inference.", file=sys.stderr)
         self.output = self.compiled.output(0)
         self.request = self.compiled.create_infer_request() if self.stateful else None
         self.model_load_seconds = time.perf_counter() - started_at

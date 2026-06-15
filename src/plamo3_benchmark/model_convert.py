@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -111,10 +112,19 @@ def _convert_new(args: Any, output_dir: Path, tokenizer: Any, ov: Any, *, target
 
     ov_model = compress_weights_for_target(ov_model, format_name, npu=target_is_npu)
     save_model_atomic(ov, ov_model, output_dir / "openvino_model.xml", fp16=format_name == "fp16")
+    _clear_model_cache(output_dir)
     save_tokenizer_and_configs(ov, tokenizer, args, output_dir)
     write_info(output_dir, _conversion_info(args, format_name, trace_len=traced_len))
     print(f"Saved OpenVINO model directory to: {output_dir}", file=sys.stderr)
     return 0
+
+
+def _clear_model_cache(output_dir: Path) -> None:
+    cache_dir = output_dir / ".openvino_cache"
+    if not cache_dir.exists():
+        return
+    shutil.rmtree(cache_dir)
+    print(f"Cleared stale OpenVINO model cache: {cache_dir}", file=sys.stderr)
 
 
 def _conversion_info(args: Any, format_name: str, trace_len: int | None) -> dict[str, Any]:

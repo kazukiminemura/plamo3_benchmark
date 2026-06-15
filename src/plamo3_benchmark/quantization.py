@@ -27,7 +27,7 @@ def compression_mode(format_name: str, *, npu: bool) -> str | None:
 
 def compression_options(format_name: str, *, npu: bool) -> dict[str, Any]:
     if npu and format_name == "int4":
-        return {"symmetric": True, "group_size": 128, "ratio": 1.0, "backup_mode": "INT8_SYM"}
+        return {"symmetric": True, "group_size": -1, "ratio": 1.0}
     return {}
 
 
@@ -37,7 +37,7 @@ def compress_weights_for_target(ov_model: Any, format_name: str, *, npu: bool) -
         return ov_model
 
     try:
-        from nncf import BackupMode, CompressWeightsMode, GroupSizeFallbackMode, compress_weights
+        from nncf import CompressWeightsMode, GroupSizeFallbackMode, compress_weights
         from nncf.quantization.advanced_parameters import AdvancedCompressionParameters
     except ImportError as exc:
         die("NNCF is required for int8/int4 weight compression. Run `uv sync` first.")
@@ -48,7 +48,7 @@ def compress_weights_for_target(ov_model: Any, format_name: str, *, npu: bool) -
     if format_name == "int4":
         advanced_parameters = AdvancedCompressionParameters(group_size_fallback_mode=GroupSizeFallbackMode.ADJUST)
         if npu:
-            kwargs = {"ratio": 1.0, "group_size": 128, "backup_mode": BackupMode.INT8_SYM}
+            kwargs = {"ratio": 1.0, "group_size": -1}
 
     print(f"Compressing OpenVINO model weights to {mode_name} with NNCF...", file=sys.stderr)
     return compress_weights(

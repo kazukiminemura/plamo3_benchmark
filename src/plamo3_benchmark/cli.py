@@ -67,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "OpenVINO save precision. int8 applies NNCF INT8_ASYM weight compression; "
             "int4 applies NNCF INT4_ASYM weight compression. With --target-device NPU, "
-            "the model is saved as INT4_SYM with group_size=128 and ratio=1.0."
+            "the model is saved as INT4_SYM channel-wise with ratio=1.0."
         ),
     )
     convert_parser.add_argument(
