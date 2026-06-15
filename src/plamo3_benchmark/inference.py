@@ -116,35 +116,43 @@ def emit_metrics(
     )
 
 
-class OpenVINOGenAIGenerator:
+class BaseGenerator:
+    uses_native_chat = False
+
     def __init__(self, args: Any) -> None:
-        started_at = time.perf_counter()
         self.args = args
         self.model_dir = Path(args.model)
         self.model_info = read_model_info(self.model_dir)
-        self.uses_native_chat = not self._is_base_model()
         self.in_chat = False
         self.tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, use_fast=False)
-        self._require_beam_idx()
+        self.model_load_seconds = 0.0
+
+    def emit_metrics(
+        self,
+        output_tokens: int,
+        started_at: float,
+        first_token_at: float | None,
+        finished_at: float | None = None,
+    ) -> None:
+        emit_metrics(self.model_load_seconds, output_tokens, started_at, first_token_at, finished_at or time.perf_counter())
+
+    def start_chat(self, system_message: str = "") -> None:
+        return None
+
+    def finish_chat(self) -> None:
+        return None
+
+
+class OpenVINOGenAIGenerator(BaseGenerator):
+    def __init__(self, args: Any) -> None:
+        started_at = time.perf_counter()
+        super().__init__(args)
+        model_id = str(self.model_info.get("model", "")).lower()
+        self.uses_native_chat = not (model_id.endswith("-base") or "base" in model_id.rsplit("/", 1)[-1].split("-"))
 
         print(f"Using OpenVINO GenAI inference device: {args.device}", file=sys.stderr)
         self.pipe = ov_genai.LLMPipeline(str(args.model), args.device, cache_config(args, self.model_dir))
         self.model_load_seconds = time.perf_counter() - started_at
-
-    def _is_base_model(self) -> bool:
-        model_id = str(self.model_info.get("model", "")).lower()
-        return model_id.endswith("-base") or "base" in model_id.rsplit("/", 1)[-1].split("-")
-
-    def _require_beam_idx(self) -> None:
-        inputs = {port.get_any_name() for port in ov.Core().read_model(self.model_dir / "openvino_model.xml").inputs}
-        if "beam_idx" in inputs:
-            return
-        command = (
-            f"plamo3-ov convert --output-dir {self.model_dir} "
-            f"--weight-format {self.model_info.get('weight_format', 'fp16')} "
-            f"--target-device {self.model_info.get('target_device', 'CPU')} --force"
-        )
-        die(f"This OpenVINO model is missing `beam_idx`. Re-run `{command}`.")
 
     def _decode(self, result: Any) -> str:
         if isinstance(result, str):
@@ -187,7 +195,7 @@ class OpenVINOGenAIGenerator:
         text = self._decode(result)
         if print_output:
             print(text)
-        emit_metrics(self.model_load_seconds, self._count_tokens(text), started_at, first_token_at, finished_at)
+        self.emit_metrics(self._count_tokens(text), started_at, first_token_at, finished_at)
         return text
 
     def start_chat(self, system_message: str = "") -> None:
@@ -201,15 +209,10 @@ class OpenVINOGenAIGenerator:
             self.in_chat = False
 
 
-class DirectOpenVINOGenerator:
-    uses_native_chat = False
-
+class DirectOpenVINOGenerator(BaseGenerator):
     def __init__(self, args: Any) -> None:
         started_at = time.perf_counter()
-        self.args = args
-        self.model_dir = Path(args.model)
-        self.model_info = read_model_info(self.model_dir)
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir, trust_remote_code=True, use_fast=False)
+        super().__init__(args)
 
         core = ov.Core()
         config = cache_config(args, self.model_dir)
@@ -294,18 +297,11 @@ class DirectOpenVINOGenerator:
         prompt_ids = [int(token) for token in self.tokenizer(prompt, return_tensors="np")["input_ids"][0]]
         logits, position = self._prefill_state(prompt_ids)
         text, token_count, first_token_at = self._run_decode_loop(logits, position, print_output=print_output)
-        emit_metrics(self.model_load_seconds, token_count, started_at, first_token_at, time.perf_counter())
+        self.emit_metrics(token_count, started_at, first_token_at)
         return text
 
     def generate(self, prompt: str, *, print_output: bool, stop_strings: tuple[str, ...] = ()) -> str:
         return self._generate_stateful(prompt, print_output=print_output)
-
-    def start_chat(self, system_message: str = "") -> None:
-        return None
-
-    def finish_chat(self) -> None:
-        return None
-
 
 def is_genai_compatible(model_dir: Path) -> bool:
     if not (model_dir / "openvino_tokenizer.xml").exists() or not (model_dir / "openvino_detokenizer.xml").exists():
