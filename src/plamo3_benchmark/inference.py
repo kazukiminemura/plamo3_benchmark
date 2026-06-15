@@ -75,6 +75,28 @@ def _format_chat_prompt(messages: list[dict[str, str]], system_prompt: str | Non
     return "\n".join(parts)
 
 
+def _device_cache_name(device: str) -> str:
+    return "".join(char if char.isalnum() or char in ("-", "_", ".") else "_" for char in device).strip("_") or "device"
+
+
+def _model_cache_dir(args: Any, model_dir: Path) -> Path | None:
+    if not getattr(args, "model_cache", True):
+        return None
+    cache_dir = getattr(args, "model_cache_dir", None)
+    if cache_dir:
+        return Path(cache_dir)
+    return model_dir / ".openvino_cache" / _device_cache_name(str(args.device))
+
+
+def _openvino_cache_config(args: Any, model_dir: Path) -> dict[Any, str]:
+    cache_dir = _model_cache_dir(args, model_dir)
+    if cache_dir is None:
+        return {}
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Using OpenVINO model cache: {cache_dir}", file=sys.stderr)
+    return {ov.properties.cache_dir: str(cache_dir)}
+
+
 def _print_generation_metrics(
     model_load_seconds: float | None,
     token_count: int,
@@ -112,7 +134,7 @@ class OpenVINOGenAIGenerator:
         self._check_genai_model_inputs(self.model_dir)
         print(f"Using OpenVINO GenAI inference device: {args.device}", file=sys.stderr)
         started_at = time.perf_counter()
-        self.pipe = ov_genai.LLMPipeline(str(args.model), args.device)
+        self.pipe = ov_genai.LLMPipeline(str(args.model), args.device, _openvino_cache_config(args, self.model_dir))
         self.model_load_seconds = time.perf_counter() - started_at
 
     def _read_info(self) -> dict[str, Any]:
@@ -219,6 +241,9 @@ class DirectOpenVINOGenerator:
         self.model_dir = Path(args.model)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir, trust_remote_code=True, use_fast=False)
         core = ov.Core()
+        cache_config = _openvino_cache_config(args, self.model_dir)
+        if cache_config:
+            core.set_property(cache_config)
         model = core.read_model(self.model_dir / "openvino_model.xml")
         self.model_info = self._read_info()
         self.input_names = {item.get_any_name(): item for item in model.inputs}

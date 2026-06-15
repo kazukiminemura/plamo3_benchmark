@@ -23,6 +23,19 @@ def _add_generation_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--stream", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--skip-prompt", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
+        "--model-cache-dir",
+        help=(
+            "OpenVINO compiled model cache directory. "
+            "Default: <model>/.openvino_cache/<device>."
+        ),
+    )
+    parser.add_argument(
+        "--model-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable OpenVINO compiled model cache. Default: enabled.",
+    )
+    parser.add_argument(
         "--apply-chat-template",
         action=argparse.BooleanOptionalAction,
         default=False,
