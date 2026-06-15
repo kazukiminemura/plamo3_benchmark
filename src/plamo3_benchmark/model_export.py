@@ -28,44 +28,19 @@ def patch_gqa_attention(torch: Any) -> Any:
 
 
 def export_openvino_model(args: Any, tokenizer: Any, model: Any, ov: Any, torch: Any, dtype: Any) -> tuple[Any, int | None]:
-    if is_npu(args.target_device):
-        return _export_npu_model(args, tokenizer, model, ov, torch)
-    return _export_stateful_model(model, ov, torch, dtype)
+    input_dtype = torch.int32 if is_npu(args.target_device) else torch.int64
+    return _export_stateful_model(model, ov, torch, dtype, input_dtype=input_dtype)
 
 
-def _export_npu_model(args: Any, tokenizer: Any, model: Any, ov: Any, torch: Any) -> tuple[Any, int]:
-    trace_len = int(args.max_seq_len)
-    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
-    example_input = (
-        torch.full((1, trace_len), pad_id, dtype=torch.int32),
-        torch.ones((1, trace_len), dtype=torch.int32),
-        torch.tensor([0], dtype=torch.int32),
-    )
-    with patch_gqa_attention(torch):
-        ov_model = ov.convert_model(LogitsOnly(model).eval(), example_input=example_input, dynamo=True)
-
-    for node, name in zip(ov_model.inputs, ("input_ids", "attention_mask", "beam_idx")):
-        node.get_tensor().set_names({name})
-    ov_model.outputs[0].get_tensor().set_names({"logits"})
-    ov_model.reshape(
-        {
-            "input_ids": ov.PartialShape([1, trace_len]),
-            "attention_mask": ov.PartialShape([1, trace_len]),
-            "beam_idx": ov.PartialShape([1]),
-        }
-    )
-    return ov_model, trace_len
-
-
-def _export_stateful_model(model: Any, ov: Any, torch: Any, dtype: Any) -> tuple[Any, None]:
+def _export_stateful_model(model: Any, ov: Any, torch: Any, dtype: Any, *, input_dtype: Any) -> tuple[Any, None]:
     layers = int(getattr(model.config, "num_hidden_layers"))
     kv_heads = int(getattr(model.config, "num_key_value_heads"))
     head_dim = int(getattr(model.config, "head_dim"))
     seq_example, past_example = 8, 16
     example_input = (
-        torch.ones((1, seq_example), dtype=torch.int64),
-        torch.ones((1, past_example + seq_example), dtype=torch.int64),
-        torch.arange(past_example, past_example + seq_example, dtype=torch.int64)[None],
+        torch.ones((1, seq_example), dtype=input_dtype),
+        torch.ones((1, past_example + seq_example), dtype=input_dtype),
+        torch.arange(past_example, past_example + seq_example, dtype=input_dtype)[None],
         torch.tensor([0], dtype=torch.int32),
         *(torch.zeros((1, kv_heads, past_example, head_dim), dtype=dtype) for _ in range(layers * 2)),
     )
@@ -109,30 +84,6 @@ def _export_stateful_model(model: Any, ov: Any, torch: Any, dtype: Any) -> tuple
 
     apply_make_stateful_transformation(ov_model, state_pairs)
     return ov_model, None
-
-
-class LogitsOnly(nn.Module):
-    """Fixed-shape export used for NPU.
-
-    NPU currently needs static token shapes and int32 inputs, so we export a
-    full-context model that recomputes the prompt window instead of a dynamic
-    stateful KV-cache model.
-    """
-
-    def __init__(self, model: Any) -> None:
-        super().__init__()
-        self.model = model
-
-    def forward(self, input_ids: Any, attention_mask: Any, beam_idx: Any) -> Any:
-        import torch
-
-        logits = self.model(
-            input_ids=input_ids.to(torch.long),
-            attention_mask=attention_mask.to(torch.long),
-            use_cache=False,
-            return_dict=False,
-        )[0]
-        return logits + beam_idx.to(logits.dtype).reshape(-1, 1, 1) * 0
 
 
 class StatefulKV(nn.Module):
